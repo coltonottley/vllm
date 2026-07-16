@@ -411,6 +411,7 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
         # Diagnostic writer (no-op unless env gated).
         self._diag_writer = KvOffloadDiagWriter()
         self._diag_writer.open()
@@ -530,6 +531,49 @@ class OffloadingConnectorScheduler:
                     group_state.offload_keys[blocks_to_skip:],
                     req_status.req_context,
                 )
+
+    @staticmethod
+    def _diag_term(diag_w, rid, tgi, cp, lt, et, df):
+        """Emit lookup_terminal if writer is active."""
+        if diag_w is not None:
+            diag_w.lookup_terminal(
+                req_id=rid, terminal_group_idx=tgi,
+                total_passes=cp, final_local_tokens=lt,
+                final_external_tokens=et, defer_lookup=df)
+
+    @staticmethod
+    def _maybe_diag_lookup_group(dg, rid, cp, gidx, gcfg, rstat,
+                                  sliced_ok, sbi, qm, tb, nhb, iev, dl, dc):
+        """Emit lookup_group if writer is active, using collector results."""
+        if dg is None or dc is None:
+            return
+        if not dc:
+            return
+        rhc = sum(1 for _, r in dc if r in ("HIT", "HIT_PENDING"))
+        gt = "sliding_window" if gcfg.sliding_window_size_in_blocks is not None else "full"
+        # Compute post-eagle hit count: what nhb will be after the scheduler's
+        # trailing-block adjustment (applied after this helper returns).
+        local_defer = (nhb is None)
+        effective = nhb
+        if nhb is not None and iev:
+            effective = nhb - 1
+        peh = max(0, effective)
+        # Compute boundary after this group's result is applied.
+        obs = gcfg.offloaded_block_size
+        post_boundary = tb
+        if nhb is not None and nhb > 0:
+            post_boundary = min(tb, obs * (sbi + effective))
+        dg.lookup_group(
+            req_id=rid, convergence_pass=cp, group_idx=gidx,
+            group_type=gt, is_eagle=gcfg.is_eagle_group,
+            start_block_idx=sbi, query_max=qm,
+            token_boundary=post_boundary,
+            replay_digests=[d for d, _ in dc],
+            lookup_results=[r for _, r in dc],
+            raw_hit_count=rhc, post_eagle_hit_count=peh,
+            eagle_verified=(not iev and gcfg.is_eagle_group),
+            defer_lookup=local_defer,
+            tightened_boundary=post_boundary)
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         """
@@ -1158,6 +1202,7 @@ class OffloadingConnectorScheduler:
 
             # Diagnostic: store_prepare — per-group candidates + global selected.
             if ds is not None:
+                global_selected = [key_digest(k) for k in store_output.keys_to_store]
                 for _s in ds:
                     self._diag_writer.store_prepare(
                         req_id=req_id, group_idx=_s["gidx"],
@@ -1167,9 +1212,7 @@ class OffloadingConnectorScheduler:
                             _s["gidx"]
                         ].next_stored_block_idx,
                         cand_digests=_s["cd"],
-                        selected_digests=[
-                            key_digest(k) for k in store_output.keys_to_store
-                        ],
+                        selected_digests=global_selected,
                         block_indices=_s["ci"],
                         job_id=job_id,
                     )
