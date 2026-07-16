@@ -99,6 +99,20 @@ class GroupOffloadConfig(NamedTuple):
     is_eagle_group: bool = False
 
 
+def is_store_reachable_swa_block(
+    position_in_segment: int,
+    alignment_block_count: int | None,
+    sliding_window_blocks: int | None,
+    is_eagle_group: bool,
+) -> bool:
+    """Whether an SWA block can participate in a later external-cache hit."""
+    if alignment_block_count is None:
+        return True
+    assert sliding_window_blocks is not None
+    reachable_tail = sliding_window_blocks + int(is_eagle_group)
+    return position_in_segment >= alignment_block_count - reachable_tail
+
+
 def get_sliding_window_size_in_blocks(
     kv_cache_spec: KVCacheSpec, offloaded_block_size: int
 ) -> int | None:
@@ -1106,7 +1120,7 @@ class OffloadingConnectorScheduler:
                 assert len(offload_keys) == len(offload_block_ids)
 
                 alignment_block_count = group_config.alignment_block_count
-                tail = group_config.sliding_window_size_in_blocks
+                sliding_window_blocks = group_config.sliding_window_size_in_blocks
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
@@ -1114,16 +1128,23 @@ class OffloadingConnectorScheduler:
                     if block_id == 0:
                         continue
                     # Skip SWA blocks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing `tail` blocks are reachable by
-                    # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
-                    if alignment_block_count is not None:
-                        assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_block_count
-                        if pos_in_segment < alignment_block_count - tail:
-                            continue
+                    # within each full-attention alignment segment, retain the
+                    # trailing SWA window plus Eagle's extra verification block.
+                    # For DeepSeek V4 this prunes unreachable stores while
+                    # preserving every block queried by _sliding_window_lookup.
+                    abs_block_idx = start_block_idx + key_idx
+                    pos_in_segment = (
+                        abs_block_idx % alignment_block_count
+                        if alignment_block_count is not None
+                        else abs_block_idx
+                    )
+                    if not is_store_reachable_swa_block(
+                        pos_in_segment,
+                        alignment_block_count,
+                        sliding_window_blocks,
+                        group_config.is_eagle_group,
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
                     if diag_store_group is not None:
                         diag_store_group["cd"].append(key_digest(offload_key))

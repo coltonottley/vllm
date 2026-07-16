@@ -330,3 +330,31 @@ class TestPackageImport:
         cls = scheduler.OffloadingConnectorScheduler
         assert hasattr(cls, "_diag_term")
         assert hasattr(cls, "_maybe_diag_lookup_group")
+
+class TestEagleStoreReachability:
+    @pytest.mark.parametrize(
+        ("position", "is_eagle", "expected"),
+        [
+            (0, False, False),
+            (1, False, False),
+            (2, False, True),
+            (3, False, True),
+            (0, True, False),
+            (1, True, True),
+            (2, True, True),
+            (3, True, True),
+        ],
+    )
+    def test_alignment_tail(self, position, is_eagle, expected):
+        assert scheduler.is_store_reachable_swa_block(
+            position, 4, 2, is_eagle
+        ) is expected
+
+    def test_no_alignment_pruning(self):
+        assert scheduler.is_store_reachable_swa_block(999, None, None, True)
+
+    def test_eagle_tail_does_not_overrun_segment(self):
+        assert all(
+            scheduler.is_store_reachable_swa_block(position, 2, 2, True)
+            for position in range(2)
+        )
