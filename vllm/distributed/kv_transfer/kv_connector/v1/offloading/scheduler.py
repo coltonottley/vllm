@@ -15,6 +15,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     ReqId,
     TransferJob,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.diag import (
+    KvOffloadDiagWriter,
+    key_digest,
+    matches,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
     OffloadingEventGroupSpec,
     OffloadingEventsTracker,
@@ -406,6 +411,9 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+        # Diagnostic writer (no-op unless env gated).
+        self._diag_writer = KvOffloadDiagWriter()
+        self._diag_writer.open()
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -432,7 +440,8 @@ class OffloadingConnectorScheduler:
                 del self._block_id_to_pending_jobs[bid]
 
     def _maximal_prefix_lookup(
-        self, keys: Iterable[OffloadKey], req_context: ReqContext
+        self, keys: Iterable[OffloadKey], req_context: ReqContext,
+        diag_c: list | None = None,
     ) -> int | None:
         """Return the number of consecutive offloaded blocks from the start,
         or None if the backend deferred a lookup."""
@@ -442,14 +451,22 @@ class OffloadingConnectorScheduler:
             match self.manager.lookup(key, req_context):
                 case LookupResult.HIT:
                     hit_count += 1
+                    if diag_c is not None:
+                        diag_c.append((key_digest(key), "HIT"))
                 case LookupResult.HIT_PENDING:
                     defer_lookup = True
                     hit_count += 1
+                    if diag_c is not None:
+                        diag_c.append((key_digest(key), "HIT_PENDING"))
                 case LookupResult.RETRY:
                     # Don't break: keep scanning to let manager kick off
                     # async lookups (until a miss is detected).
                     defer_lookup = True
+                    if diag_c is not None:
+                        diag_c.append((key_digest(key), "RETRY"))
                 case LookupResult.MISS:
+                    if diag_c is not None:
+                        diag_c.append((key_digest(key), "MISS"))
                     break
         return hit_count if not defer_lookup else None
 
@@ -458,6 +475,7 @@ class OffloadingConnectorScheduler:
         keys: Sequence[OffloadKey],
         sliding_window_size: int,
         req_context: ReqContext,
+        diag_c: list | None = None,
     ) -> int | None:
         """Return the end index (in `keys`) of the last run of
         `sliding_window_size` consecutive hits, scanning from the end.
@@ -468,20 +486,28 @@ class OffloadingConnectorScheduler:
             match self.manager.lookup(keys[idx], req_context):
                 case LookupResult.HIT:
                     consecutive_hits += 1
+                    if diag_c is not None:
+                        diag_c.append((key_digest(keys[idx]), "HIT"))
                 case LookupResult.HIT_PENDING:
                     # Block is in cache, just not readable yet — counts
                     # as hit for the consecutive streak. Don't break:
                     # keep scanning to let manager kick off async lookups.
                     defer_lookup = True
                     consecutive_hits += 1
+                    if diag_c is not None:
+                        diag_c.append((key_digest(keys[idx]), "HIT_PENDING"))
                 case LookupResult.RETRY:
                     # Block location uncertain — does not count as hit.
                     # Don't break: keep scanning to let manager kick off
                     # async lookups.
                     defer_lookup = True
                     consecutive_hits = 0
+                    if diag_c is not None:
+                        diag_c.append((key_digest(keys[idx]), "RETRY"))
                 case LookupResult.MISS:
                     consecutive_hits = 0
+                    if diag_c is not None:
+                        diag_c.append((key_digest(keys[idx]), "MISS"))
             if consecutive_hits == sliding_window_size:
                 return idx + sliding_window_size if not defer_lookup else None
         return consecutive_hits if not defer_lookup else None
@@ -530,6 +556,9 @@ class OffloadingConnectorScheduler:
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
+        rid = req_status.req.request_id
+        dg = self._diag_writer if matches(rid) else None
+        cp: int = 0  # convergence pass counter for diagnostics
 
         # Tracks which eagle groups have already popped their volatile trailing block
         # in the current convergence iteration. Reset when a non-eagle group
@@ -562,6 +591,7 @@ class OffloadingConnectorScheduler:
                 )
                 if max_hit_size_tokens - num_computed_tokens < offloaded_block_size:
                     # we can only load less than a block, better skip
+                    self._diag_term(dg, rid, group_idx, cp, 0, 0, defer_lookup)
                     return 0
 
                 sliding_window_size_in_blocks = (
@@ -583,12 +613,15 @@ class OffloadingConnectorScheduler:
                 start_block_idx = num_computed_tokens // offloaded_block_size
                 offload_keys = offload_keys[start_block_idx:num_blocks]
 
+                # Diagnostic collector for per-key lookup results.
+                diag_c: list | None = [] if dg is not None else None
+
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_blocks: int | None
                 if sliding_window_size_in_blocks is None:
                     num_hit_blocks = self._maximal_prefix_lookup(
-                        offload_keys, req_status.req_context
+                        offload_keys, req_status.req_context, diag_c
                     )
                 else:
                     required_window = sliding_window_size_in_blocks
@@ -598,8 +631,14 @@ class OffloadingConnectorScheduler:
                         offload_keys,
                         required_window,
                         req_status.req_context,
+                        diag_c,
                     )
+                self._maybe_diag_lookup_group(dg, rid, cp, group_idx, group_config,
+                    req_status, offload_keys, start_block_idx,
+                    query_max, max_hit_size_tokens, num_hit_blocks,
+                    is_eagle_unverified, defer_lookup, diag_c)
                 if num_hit_blocks == 0:
+                    self._diag_term(dg, rid, group_idx, cp, 0, 0, defer_lookup)
                     return 0
 
                 if num_hit_blocks is None:
@@ -617,6 +656,7 @@ class OffloadingConnectorScheduler:
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < offloaded_block_size:
                     # we can only load less than a block, better skip
+                    self._diag_term(dg, rid, group_idx, cp, 0, 0, defer_lookup)
                     return 0
 
                 if new_num_hit_tokens < num_hit_tokens:
@@ -627,10 +667,12 @@ class OffloadingConnectorScheduler:
                         # if we still need to defer lookup
                         defer_lookup = False
                         lookup_groups = self._lookup_groups
+                        cp += 1
                     elif looked_up_sliding_window and not lookup_groups:
                         # we need another iteration to confirm previously looked up
                         # sliding window works with the new_num_hit_tokens
                         lookup_groups = self._sliding_window_groups
+                        cp += 1
 
                 looked_up_sliding_window |= sliding_window_size_in_blocks is not None
                 num_hit_tokens = new_num_hit_tokens
@@ -640,6 +682,7 @@ class OffloadingConnectorScheduler:
                 "Offloading manager delayed request %s as backend requested",
                 req_status.req.request_id,
             )
+            self._diag_term(dg, rid, None, cp, num_computed_tokens, num_hit_tokens, True)
             return None
 
         # possibly delay request if any of the hit blocks is already being loaded
@@ -666,6 +709,7 @@ class OffloadingConnectorScheduler:
                         " blocks are already being loaded",
                         req_status.req.request_id,
                     )
+                    self._diag_term(dg, rid, None, cp, num_computed_tokens, num_hit_tokens, True)
                     return None
 
         logger.debug(
@@ -674,6 +718,7 @@ class OffloadingConnectorScheduler:
             num_hit_tokens,
             num_computed_tokens,
         )
+        self._diag_term(dg, rid, None, cp, num_computed_tokens, num_hit_tokens, False)
 
         return num_hit_tokens
 
@@ -688,6 +733,24 @@ class OffloadingConnectorScheduler:
             offloading_context=offloading_context,
         )
         self._req_status[request.request_id] = req_status
+
+        # Diagnostic: group_specs (once per request).
+        if matches(request.request_id):
+            gs = []
+            for g in self.config.kv_group_configs:
+                gs.append({
+                    "group_idx": g.group_idx,
+                    "attention_kind": (
+                        "sliding_window"
+                        if g.sliding_window_size_in_blocks is not None
+                        else "full"
+                    ),
+                    "is_eagle_group": g.is_eagle_group,
+                    "offloaded_block_size": g.offloaded_block_size,
+                    "hash_block_size_factor": g.hash_block_size_factor,
+                    "sliding_window_blocks": g.sliding_window_size_in_blocks,
+                })
+            self._diag_writer.group_specs(request.request_id, gs)
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -975,6 +1038,24 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
+            # Diagnostic snapshot: per-group candidate keys.
+            ds = None
+            if matches(req_id):
+                ds = []
+                for _gcfg, _gst in zip(
+                    self.config.kv_group_configs, req_status.group_states
+                ):
+                    _nb = req_status.storable_blocks(_gcfg, num_offloadable_tokens)
+                    _next = _gst.next_stored_block_idx
+                    _ok = _gst.offload_keys
+                    ds.append({
+                        "gidx": _gcfg.group_idx,
+                        "storable": _nb,
+                        "nb": _next,
+                        "cd": [key_digest(k) for k in _ok[_next:_nb]],
+                        "ci": list(range(_next, _nb)),
+                    })
+
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
             )
@@ -1074,6 +1155,24 @@ class OffloadingConnectorScheduler:
             store_jobs[job_id] = TransferJob(
                 req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
             )
+
+            # Diagnostic: store_prepare — per-group candidates + global selected.
+            if ds is not None:
+                for _s in ds:
+                    self._diag_writer.store_prepare(
+                        req_id=req_id, group_idx=_s["gidx"],
+                        storable=_s["storable"],
+                        next_before=_s["nb"],
+                        next_after=req_status.group_states[
+                            _s["gidx"]
+                        ].next_stored_block_idx,
+                        cand_digests=_s["cd"],
+                        selected_digests=[
+                            key_digest(k) for k in store_output.keys_to_store
+                        ],
+                        block_indices=_s["ci"],
+                        job_id=job_id,
+                    )
 
             logger.debug(
                 "Request %s offloading %s blocks upto %d tokens (job %d)",
@@ -1196,6 +1295,15 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
+                # Diagnostic: store_complete (completed keys = authority).
+                if matches(job_status.req_id):
+                    self._diag_writer.store_complete(
+                        req_id=job_status.req_id,
+                        completed_digests=[
+                            key_digest(k) for k in job_status.keys
+                        ],
+                        success=True,
+                    )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._blocks_being_loaded:
@@ -1255,13 +1363,37 @@ class OffloadingConnectorScheduler:
             req_context = _create_req_context(request)
             self.manager.on_new_request(req_context)
             self.manager.on_request_finished(req_context)
+            if matches(request.request_id):
+                self._diag_writer.request_finished(
+                    req_id=request.request_id,
+                    next_stored_block_indices=[],
+                    total_keys=[], total_block_ids=[],
+                    pending_job_ids=[], has_in_flight_jobs=False,
+                )
             return False, None
 
         self.manager.on_request_finished(req_status.req_context)
         self._maybe_observe_lookup_async_delay(req_status)
+
+        # Diagnostic: request_finished state.
+        _rid = request.request_id
+        if matches(_rid):
+            _dnx = [gs.next_stored_block_idx for gs in req_status.group_states]
+            _dtk = [len(gs.offload_keys) for gs in req_status.group_states]
+            _dtb = [len(gs.block_ids) for gs in req_status.group_states]
+        else:
+            _dnx = _dtk = _dtb = ()
+
         if not req_status.transfer_jobs:
             # No in-flight jobs: no later complete_store()/complete_load() calls
             # need this request's state.
+            if matches(_rid):
+                self._diag_writer.request_finished(
+                    req_id=_rid,
+                    next_stored_block_indices=_dnx,
+                    total_keys=_dtk, total_block_ids=_dtb,
+                    pending_job_ids=[], has_in_flight_jobs=False,
+                )
             del self._req_status[request.request_id]
             return False, None
 
@@ -1273,6 +1405,14 @@ class OffloadingConnectorScheduler:
             job_status = self._jobs[job_id]
             for bid in job_status.non_sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
+        if matches(_rid):
+            self._diag_writer.request_finished(
+                req_id=_rid,
+                next_stored_block_indices=_dnx,
+                total_keys=_dtk, total_block_ids=_dtb,
+                pending_job_ids=list(req_status.transfer_jobs),
+                has_in_flight_jobs=True,
+            )
         return False, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
