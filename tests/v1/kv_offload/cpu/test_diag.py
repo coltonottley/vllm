@@ -18,24 +18,15 @@ The diag module is pure stdlib and can be tested without torch/vLLM.
 import hashlib
 import json
 import os
-import sys
-import types
 
 import pytest
 
-_DIAG_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "..", "..", "..", "..",
-    "vllm", "distributed", "kv_transfer",
-    "kv_connector", "v1", "offloading", "diag.py",
-)
-
-_IS_VLLM_IMPORTABLE = False
 try:
-    import vllm  # noqa: F401
-    _IS_VLLM_IMPORTABLE = True
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import diag
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import scheduler
 except ImportError:
-    pass
+    diag = None
+    scheduler = None
 
 
 # ---------------------------------------------------------------------------
@@ -45,18 +36,19 @@ except ImportError:
 
 @pytest.fixture(scope="module")
 def diag_mod():
-    """Load the real diag.py module into an isolated namespace.
-
-    This works without torch because diag.py is pure stdlib.
-    It is NOT a ``vllm.xxx`` package import — the vLLM package requires
-    torch at import time and is not available in this test environment.
-    """
-    mod = types.ModuleType("diag_test")
-    for k in ("VLLM_DIAG_KV_OFFLOAD_REQUEST_PREFIX",
-              "VLLM_DIAG_KV_OFFLOAD_PATH"):
-        os.environ.pop(k, None)
-    exec(open(_DIAG_PATH).read(), mod.__dict__)
-    return mod
+    """Return the normally imported production diagnostic module."""
+    if diag is None:
+        pytest.skip("vLLM package not importable")
+    for key in (
+        "VLLM_DIAG_KV_OFFLOAD_REQUEST_PREFIX",
+        "VLLM_DIAG_KV_OFFLOAD_PATH",
+    ):
+        os.environ.pop(key, None)
+    diag._PREFIX = None
+    diag._PATH = None
+    diag._GATE = False
+    diag._seqs.clear()
+    return diag
 
 
 # ============================================================================
@@ -107,18 +99,24 @@ class TestGateOn:
         for k in ("VLLM_DIAG_KV_OFFLOAD_REQUEST_PREFIX",
                   "VLLM_DIAG_KV_OFFLOAD_PATH"):
             os.environ.pop(k, None)
-        if os.path.exists("/tmp/test-diag-pytest.jsonl"):
-            os.unlink("/tmp/test-diag-pytest.jsonl")
+        trace_path = self._trace_path()
+        if os.path.exists(trace_path):
+            os.unlink(trace_path)
 
     @staticmethod
-    def _read_records():
-        with open("/tmp/test-diag-pytest.jsonl") as f:
+    def _trace_path():
+        return f"/tmp/test-diag-pytest.jsonl.pid{os.getpid()}"
+
+    @classmethod
+    def _read_records(cls):
+        with open(cls._trace_path()) as f:
             return [json.loads(l) for l in f if l.strip()]
 
-    @staticmethod
-    def _fresh_writer(diag_mod):
-        if os.path.exists("/tmp/test-diag-pytest.jsonl"):
-            os.unlink("/tmp/test-diag-pytest.jsonl")
+    @classmethod
+    def _fresh_writer(cls, diag_mod):
+        trace_path = cls._trace_path()
+        if os.path.exists(trace_path):
+            os.unlink(trace_path)
         w = diag_mod.KvOffloadDiagWriter()
         w.open()
         diag_mod._seqs.clear()
@@ -240,58 +238,63 @@ class TestGateOn:
         assert a[1]["seq"] == 2
         assert b[0]["seq"] == 1
 
-    # -- deterministic collector test (catches falsy-list bug) ---------------
+    # -- production collector integration (catches falsy-list bug) ------------
 
-    def test_collector_receives_first_hit(self, diag_mod):
-        """An empty collector list passed to the lookup helpers must receive
-        the first HIT result.  This catches ``diag_c and diag_c.append()``
-        falsy-list bugs."""
-        kd = diag_mod.key_digest
-        k0 = b"\x00" * 32 + (0).to_bytes(4, "big")
+    @pytest.mark.parametrize(
+        ("lookup_result_name", "expected_count"),
+        (("HIT", 1), ("MISS", 0), ("RETRY", None), ("HIT_PENDING", None)),
+    )
+    def test_maximal_lookup_captures_first_result(
+        self, lookup_result_name, expected_count
+    ):
+        """Invoke the real scheduler helper with a fresh empty collector."""
+        if scheduler is None:
+            pytest.skip("vLLM package not importable")
+        from types import SimpleNamespace
+        from vllm.v1.kv_offload.base import LookupResult
+
+        result = getattr(LookupResult, lookup_result_name)
+
+        class FakeManager:
+            def lookup(self, key, req_context):
+                return result
+
+        fake_scheduler = SimpleNamespace(manager=FakeManager())
         collector = []
-        # Simulate what _maximal_prefix_lookup does on HIT
-        if collector is not None:
-            collector.append((kd(k0), "HIT"))
-        assert len(collector) == 1
-        assert collector[0] == (kd(k0), "HIT")
-
-    def test_collector_receives_first_miss(self, diag_mod):
-        """Same for MISS."""
-        kd = diag_mod.key_digest
-        k0 = b"\x00" * 32 + (0).to_bytes(4, "big")
-        collector = []
-        if collector is not None:
-            collector.append((kd(k0), "MISS"))
-        assert len(collector) == 1
-
-    def test_collector_receives_first_retry(self, diag_mod):
-        """Same for RETRY."""
-        kd = diag_mod.key_digest
-        k0 = b"\x00" * 32 + (0).to_bytes(4, "big")
-        collector = []
-        if collector is not None:
-            collector.append((kd(k0), "RETRY"))
-        assert len(collector) == 1
-
-    def test_collector_receives_first_pending(self, diag_mod):
-        """Same for HIT_PENDING."""
-        kd = diag_mod.key_digest
-        k0 = b"\x00" * 32 + (0).to_bytes(4, "big")
-        collector = []
-        if collector is not None:
-            collector.append((kd(k0), "HIT_PENDING"))
-        assert len(collector) == 1
-
-    def test_original_code_uses_correct_pattern(self, diag_mod):
-        """Verify the scheduler source uses `if diag_c is not None:` not
-        `diag_c and` — checked at import/parse time via a string inspection
-        of the hook script output."""
-        sched_path = os.path.join(
-            os.path.dirname(_DIAG_PATH), "scheduler.py"
+        count = scheduler.OffloadingConnectorScheduler._maximal_prefix_lookup(
+            fake_scheduler, [b"first-key"], object(), collector
         )
-        if not os.path.exists(sched_path):
-            pytest.skip("scheduler.py not found at expected path")
-        with open(sched_path) as f:
+        assert count == expected_count
+        assert collector == [
+            (hashlib.sha256(b"first-key").hexdigest(), lookup_result_name)
+        ]
+
+    def test_sliding_lookup_captures_first_result(self):
+        """Invoke the real reverse-scan helper, not a copied append pattern."""
+        if scheduler is None:
+            pytest.skip("vLLM package not importable")
+        from types import SimpleNamespace
+        from vllm.v1.kv_offload.base import LookupResult
+
+        class FakeManager:
+            def lookup(self, key, req_context):
+                return LookupResult.HIT
+
+        fake_scheduler = SimpleNamespace(manager=FakeManager())
+        collector = []
+        count = scheduler.OffloadingConnectorScheduler._sliding_window_lookup(
+            fake_scheduler, [b"first-key"], 1, object(), collector
+        )
+        assert count == 1
+        assert collector == [
+            (hashlib.sha256(b"first-key").hexdigest(), "HIT")
+        ]
+
+    def test_original_code_uses_correct_pattern(self):
+        """Reject the empty-list truthiness bug in the imported scheduler."""
+        if scheduler is None:
+            pytest.skip("vLLM package not importable")
+        with open(scheduler.__file__) as f:
             src = f.read()
         # Count uses of the correct pattern
         correct = src.count("if diag_c is not None:")
@@ -311,29 +314,19 @@ class TestGateOn:
 
 
 class TestPackageImport:
-    """Verify the real vLLM package can import ``diag`` and ``scheduler``.
-
-    These tests require torch and the vLLM package to be installed.
-    They are skipped when the environment does not have them.
-    """
+    """Verify normal package import and integration symbols."""
 
     def test_diag_module_importable(self):
-        if not _IS_VLLM_IMPORTABLE:
-            pytest.skip("vLLM package not importable (torch missing)")
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import diag  # noqa: F811
+        assert diag is not None
         assert hasattr(diag, "matches")
         assert hasattr(diag, "key_digest")
         assert hasattr(diag, "KvOffloadDiagWriter")
 
     def test_scheduler_importable(self):
-        if not _IS_VLLM_IMPORTABLE:
-            pytest.skip("vLLM package not importable (torch missing)")
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import scheduler  # noqa: F811
+        assert scheduler is not None
         assert hasattr(scheduler, "OffloadingConnectorScheduler")
 
-    def test_no_circular_import(self):
-        if not _IS_VLLM_IMPORTABLE:
-            pytest.skip("vLLM package not importable (torch missing)")
-        # Import scheduler first, then diag — catches circular dependency
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import scheduler  # noqa: F401, F811
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import diag  # noqa: F401, F811
+    def test_diagnostic_helpers_exist(self):
+        cls = scheduler.OffloadingConnectorScheduler
+        assert hasattr(cls, "_diag_term")
+        assert hasattr(cls, "_maybe_diag_lookup_group")

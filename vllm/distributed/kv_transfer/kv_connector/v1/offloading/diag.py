@@ -21,7 +21,9 @@ def _resolve() -> None:
     p = os.environ.get("VLLM_DIAG_KV_OFFLOAD_REQUEST_PREFIX", "")
     q = os.environ.get("VLLM_DIAG_KV_OFFLOAD_PATH", "")
     if p and q:
-        _PREFIX, _PATH, _GATE = p, q, True
+        _PREFIX = p
+        _PATH = f"{q}.pid{os.getpid()}"
+        _GATE = True
     else:
         _PREFIX, _PATH, _GATE = "", "", False
 
@@ -104,7 +106,8 @@ class KvOffloadDiagWriter:
                      token_boundary: int,
                      replay_digests: Sequence[str],
                      lookup_results: Sequence[str],
-                     raw_hit_count: int, post_eagle_hit_count: int,
+                     raw_hit_count: int,
+                     post_eagle_hit_count: int | None,
                      eagle_verified: bool, defer_lookup: bool,
                      tightened_boundary: int) -> None:
         self._emit(req_id, "lookup_group",

@@ -542,38 +542,64 @@ class OffloadingConnectorScheduler:
                 final_external_tokens=et, defer_lookup=df)
 
     @staticmethod
-    def _maybe_diag_lookup_group(dg, rid, cp, gidx, gcfg, rstat,
-                                  sliced_ok, sbi, qm, tb, nhb, iev, dl, dc):
-        """Emit lookup_group if writer is active, using collector results."""
-        if dg is None or dc is None:
+    def _maybe_diag_lookup_group(
+        diag_writer,
+        request_id,
+        convergence_pass,
+        group_idx,
+        group_config,
+        start_block_idx,
+        query_max,
+        token_boundary,
+        num_hit_blocks,
+        is_eagle_unverified,
+        collector,
+    ):
+        """Emit one group's actual per-key lookup results and post-group state."""
+        if diag_writer is None or not collector:
             return
-        if not dc:
-            return
-        rhc = sum(1 for _, r in dc if r in ("HIT", "HIT_PENDING"))
-        gt = "sliding_window" if gcfg.sliding_window_size_in_blocks is not None else "full"
-        # Compute post-eagle hit count: what nhb will be after the scheduler's
-        # trailing-block adjustment (applied after this helper returns).
-        local_defer = (nhb is None)
-        effective = nhb
-        if nhb is not None and iev:
-            effective = nhb - 1
-        peh = max(0, effective)
-        # Compute boundary after this group's result is applied.
-        obs = gcfg.offloaded_block_size
-        post_boundary = tb
-        if nhb is not None and nhb > 0:
-            post_boundary = min(tb, obs * (sbi + effective))
-        dg.lookup_group(
-            req_id=rid, convergence_pass=cp, group_idx=gidx,
-            group_type=gt, is_eagle=gcfg.is_eagle_group,
-            start_block_idx=sbi, query_max=qm,
+        raw_hit_count = sum(
+            1 for _, result in collector if result in ("HIT", "HIT_PENDING")
+        )
+        group_type = (
+            "sliding_window"
+            if group_config.sliding_window_size_in_blocks is not None
+            else "full"
+        )
+        local_defer = num_hit_blocks is None
+        effective_hit_blocks = num_hit_blocks
+        if effective_hit_blocks is not None and is_eagle_unverified:
+            effective_hit_blocks -= 1
+        post_eagle_hit_count = (
+            None if effective_hit_blocks is None else max(0, effective_hit_blocks)
+        )
+        post_boundary = token_boundary
+        if effective_hit_blocks is not None and effective_hit_blocks > 0:
+            post_boundary = min(
+                token_boundary,
+                group_config.offloaded_block_size
+                * (start_block_idx + effective_hit_blocks),
+            )
+        eagle_verified_after = group_config.is_eagle_group and (
+            not is_eagle_unverified or num_hit_blocks is not None
+        )
+        diag_writer.lookup_group(
+            req_id=request_id,
+            convergence_pass=convergence_pass,
+            group_idx=group_idx,
+            group_type=group_type,
+            is_eagle=group_config.is_eagle_group,
+            start_block_idx=start_block_idx,
+            query_max=query_max,
             token_boundary=post_boundary,
-            replay_digests=[d for d, _ in dc],
-            lookup_results=[r for _, r in dc],
-            raw_hit_count=rhc, post_eagle_hit_count=peh,
-            eagle_verified=(not iev and gcfg.is_eagle_group),
+            replay_digests=[digest for digest, _ in collector],
+            lookup_results=[result for _, result in collector],
+            raw_hit_count=raw_hit_count,
+            post_eagle_hit_count=post_eagle_hit_count,
+            eagle_verified=eagle_verified_after,
             defer_lookup=local_defer,
-            tightened_boundary=post_boundary)
+            tightened_boundary=post_boundary,
+        )
 
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         """
@@ -677,10 +703,19 @@ class OffloadingConnectorScheduler:
                         req_status.req_context,
                         diag_c,
                     )
-                self._maybe_diag_lookup_group(dg, rid, cp, group_idx, group_config,
-                    req_status, offload_keys, start_block_idx,
-                    query_max, max_hit_size_tokens, num_hit_blocks,
-                    is_eagle_unverified, defer_lookup, diag_c)
+                self._maybe_diag_lookup_group(
+                    dg,
+                    rid,
+                    cp,
+                    group_idx,
+                    group_config,
+                    start_block_idx,
+                    query_max,
+                    max_hit_size_tokens,
+                    num_hit_blocks,
+                    is_eagle_unverified,
+                    diag_c,
+                )
                 if num_hit_blocks == 0:
                     self._diag_term(dg, rid, group_idx, cp, 0, 0, defer_lookup)
                     return 0
@@ -1034,6 +1069,9 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            diag_store_groups: list[dict[str, Any]] | None = (
+                [] if matches(req_id) else None
+            )
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -1042,6 +1080,16 @@ class OffloadingConnectorScheduler:
                 )
 
                 start_block_idx = group_state.next_stored_block_idx
+                diag_store_group: dict[str, Any] | None = None
+                if diag_store_groups is not None:
+                    diag_store_group = {
+                        "gidx": group_config.group_idx,
+                        "storable": num_blocks,
+                        "nb": start_block_idx,
+                        "cd": [],
+                        "ci": [],
+                    }
+                    diag_store_groups.append(diag_store_group)
                 if num_blocks <= start_block_idx:
                     continue
                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
@@ -1077,28 +1125,13 @@ class OffloadingConnectorScheduler:
                         if pos_in_segment < alignment_block_count - tail:
                             continue
                     new_offload_keys.append(offload_key)
+                    if diag_store_group is not None:
+                        diag_store_group["cd"].append(key_digest(offload_key))
+                        diag_store_group["ci"].append(start_block_idx + key_idx)
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
-
-            # Diagnostic snapshot: per-group candidate keys.
-            ds = None
-            if matches(req_id):
-                ds = []
-                for _gcfg, _gst in zip(
-                    self.config.kv_group_configs, req_status.group_states
-                ):
-                    _nb = req_status.storable_blocks(_gcfg, num_offloadable_tokens)
-                    _next = _gst.next_stored_block_idx
-                    _ok = _gst.offload_keys
-                    ds.append({
-                        "gidx": _gcfg.group_idx,
-                        "storable": _nb,
-                        "nb": _next,
-                        "cd": [key_digest(k) for k in _ok[_next:_nb]],
-                        "ci": list(range(_next, _nb)),
-                    })
 
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
@@ -1200,20 +1233,20 @@ class OffloadingConnectorScheduler:
                 req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
             )
 
-            # Diagnostic: store_prepare — per-group candidates + global selected.
-            if ds is not None:
+            # Diagnostic: per-group filtered candidates + global selected keys.
+            if diag_store_groups is not None:
                 global_selected = [key_digest(k) for k in store_output.keys_to_store]
-                for _s in ds:
+                for diag_store_group in diag_store_groups:
                     self._diag_writer.store_prepare(
-                        req_id=req_id, group_idx=_s["gidx"],
-                        storable=_s["storable"],
-                        next_before=_s["nb"],
+                        req_id=req_id, group_idx=diag_store_group["gidx"],
+                        storable=diag_store_group["storable"],
+                        next_before=diag_store_group["nb"],
                         next_after=req_status.group_states[
-                            _s["gidx"]
+                            diag_store_group["gidx"]
                         ].next_stored_block_idx,
-                        cand_digests=_s["cd"],
+                        cand_digests=diag_store_group["cd"],
                         selected_digests=global_selected,
-                        block_indices=_s["ci"],
+                        block_indices=diag_store_group["ci"],
                         job_id=job_id,
                     )
 
