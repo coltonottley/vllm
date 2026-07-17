@@ -100,7 +100,8 @@ class GroupOffloadConfig(NamedTuple):
 
 
 def is_store_reachable_swa_block(
-    position_in_segment: int,
+    absolute_block_index: int,
+    storable_block_count: int,
     alignment_block_count: int | None,
     sliding_window_blocks: int | None,
     is_eagle_group: bool,
@@ -109,8 +110,13 @@ def is_store_reachable_swa_block(
     if alignment_block_count is None:
         return True
     assert sliding_window_blocks is not None
+    position_in_segment = absolute_block_index % alignment_block_count
+    segment_start = absolute_block_index - position_in_segment
+    actual_segment_length = min(
+        alignment_block_count, storable_block_count - segment_start
+    )
     reachable_tail = sliding_window_blocks + int(is_eagle_group)
-    return position_in_segment >= alignment_block_count - reachable_tail
+    return position_in_segment >= actual_segment_length - reachable_tail
 
 
 def get_sliding_window_size_in_blocks(
@@ -1133,13 +1139,9 @@ class OffloadingConnectorScheduler:
                     # For DeepSeek V4 this prunes unreachable stores while
                     # preserving every block queried by _sliding_window_lookup.
                     abs_block_idx = start_block_idx + key_idx
-                    pos_in_segment = (
-                        abs_block_idx % alignment_block_count
-                        if alignment_block_count is not None
-                        else abs_block_idx
-                    )
                     if not is_store_reachable_swa_block(
-                        pos_in_segment,
+                        abs_block_idx,
+                        num_blocks,
                         alignment_block_count,
                         sliding_window_blocks,
                         group_config.is_eagle_group,

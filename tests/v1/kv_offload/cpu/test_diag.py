@@ -333,28 +333,45 @@ class TestPackageImport:
 
 class TestEagleStoreReachability:
     @pytest.mark.parametrize(
-        ("position", "is_eagle", "expected"),
+        ("absolute_index", "storable_count", "is_eagle", "expected"),
         [
-            (0, False, False),
-            (1, False, False),
-            (2, False, True),
-            (3, False, True),
-            (0, True, False),
-            (1, True, True),
-            (2, True, True),
-            (3, True, True),
+            (0, 4, False, False),
+            (1, 4, False, False),
+            (2, 4, False, True),
+            (3, 4, False, True),
+            (0, 4, True, False),
+            (1, 4, True, True),
+            (2, 4, True, True),
+            (3, 4, True, True),
+            (45, 48, False, False),
+            (46, 48, False, True),
+            (47, 48, False, True),
+            (44, 48, True, False),
+            (45, 48, True, True),
+            (46, 48, True, True),
+            (47, 48, True, True),
+            (77, 80, False, False),
+            (78, 80, False, True),
+            (79, 80, False, True),
         ],
     )
-    def test_alignment_tail(self, position, is_eagle, expected):
+    def test_alignment_tail(
+        self, absolute_index, storable_count, is_eagle, expected
+    ):
         assert scheduler.is_store_reachable_swa_block(
-            position, 4, 2, is_eagle
+            absolute_index, storable_count, 64 if storable_count > 4 else 4,
+            2, is_eagle
         ) is expected
 
     def test_no_alignment_pruning(self):
-        assert scheduler.is_store_reachable_swa_block(999, None, None, True)
+        assert scheduler.is_store_reachable_swa_block(
+            999, 1000, None, None, True
+        )
 
     def test_eagle_tail_does_not_overrun_segment(self):
         assert all(
-            scheduler.is_store_reachable_swa_block(position, 2, 2, True)
+            scheduler.is_store_reachable_swa_block(
+                position, 2, 64, 2, True
+            )
             for position in range(2)
         )
