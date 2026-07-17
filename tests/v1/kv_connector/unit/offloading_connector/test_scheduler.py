@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    max_sliding_window_gpu_block_span,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -2757,3 +2758,246 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     # Verify fence is empty after full lifecycle (cleanup happened).
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
     assert len(runner.connector_scheduler._jobs) == 0
+
+# -- SWA pending-block span helpers (test-only; mirrors scheduler.py:936-960) --
+
+
+def _swa_num_gpu_blocks(num_cached_tokens: int, gpu_block_size: int) -> int:
+    """cdiv(num_cached_tokens, gpu_block_size) -- scheduler.py line 939."""
+    return (num_cached_tokens + gpu_block_size - 1) // gpu_block_size
+
+
+def _swa_num_skipped_blocks(
+    num_cached_tokens: int, sliding_window: int, gpu_block_size: int
+) -> int:
+    """max(0, num_cached_tokens - sliding_window + 1) // gpu_block_size -- line 946."""
+    return max(0, num_cached_tokens - sliding_window + 1) // gpu_block_size
+
+
+def _swa_pending_blocks(
+    num_cached_tokens: int, gpu_block_size: int, sliding_window: int
+) -> int:
+    """Pending GPU blocks computed by update_state_after_alloc (cold SWA)."""
+    total = _swa_num_gpu_blocks(num_cached_tokens, gpu_block_size)
+    skipped = _swa_num_skipped_blocks(num_cached_tokens, sliding_window, gpu_block_size)
+    return total - skipped
+
+
+
+
+
+def _swa_old_bound(
+    sliding_window: int, gpu_block_size: int, block_size_factor: int
+) -> int:
+    """Historical assertion bound: ceil(s/(g*f)) * f.
+
+    Replaced by max_sliding_window_gpu_block_span because this formula
+    rounds down to offload-block granularity before multiplying back,
+    losing one GPU block when the sliding window does not align with
+    GPU block boundaries.
+    """
+    offloaded = gpu_block_size * block_size_factor
+    return (sliding_window + offloaded - 1) // offloaded * block_size_factor
+
+
+def test_swa_pending_block_span_diagnostic():
+    """(a) Prove max_sliding_window_gpu_block_span is the correct bound
+    for all token counts at production and test geometries.
+
+    The historical bound ceil(s/(g*f))*f undercounts by exactly 1 GPU
+    block when the sliding window spans a partial first/last GPU block.
+    """
+    # --- Test geometry: gpu_bs=4, sw=7 ---
+    g, s = 4, 7
+    correct = max_sliding_window_gpu_block_span(s, g)
+    old = _swa_old_bound(s, g, 1)  # ceil(7/4)*1 = 2
+
+    assert old == 2, f"expected old bound 2, got {old}"
+    assert correct == 3, f"expected correct bound 3, got {correct}"
+    assert correct == old + 1  # old bound is short by exactly 1 GPU block
+
+    # Sweep: pending never exceeds the correct bound.
+    max_seen = 0
+    for n in range(s, 200):
+        pend = _swa_pending_blocks(n, g, s)
+        assert pend <= correct, f"n={n}: pending={pend} > correct={correct}"
+        max_seen = max(max_seen, pend)
+    assert max_seen == correct, f"max pending {max_seen} != correct bound {correct}"
+
+    # --- DeepSeek V4 production: gpu_bs=32, sw=4096 ---
+    g, s = 32, 4096
+    correct = max_sliding_window_gpu_block_span(s, g)
+    old = _swa_old_bound(s, g, 8)  # ceil(4096/256)*8 = 128
+
+    assert old == 128, f"expected old bound 128, got {old}"
+    assert correct == 129, f"expected correct bound 129, got {correct}"
+    assert correct == old + 1
+
+    # Sweep production-scale token counts.
+    max_seen = 0
+    for n in range(s, 200000, 19):  # sample every 19th token
+        pend = _swa_pending_blocks(n, g, s)
+        assert pend <= correct, f"n={n}: pending={pend} > correct={correct}"
+        max_seen = max(max_seen, pend)
+    assert max_seen == correct, f"max pending {max_seen} != correct bound {correct}"
+
+    # Queen crash value exercised explicitly.
+    pend_queen = _swa_pending_blocks(98012, 32, 4096)
+    assert pend_queen == 129, f"Queen crash pending was {pend_queen}, expected 129"
+
+    # Aligned and worst-case spans.
+    # s=4096, g=32 -> aligned: 128 blocks; worst-case (window starts at
+    # token offset 1 within a GPU block): 129 blocks.
+    aligned_pending = _swa_pending_blocks(4096 + 4096, 32, 4096)
+    assert aligned_pending == 128, f"aligned span gave {aligned_pending}, expected 128"
+    worst_case_pending = _swa_pending_blocks(4096 + 4096 + 1, 32, 4096)
+    assert worst_case_pending == 129, (
+        f"worst-case unaligned span gave {worst_case_pending}, expected 129"
+    )
+
+
+
+
+def test_swa_pending_bound_regression():
+    """Direct unit test of update_state_after_alloc with correct bound.
+
+    Constructs a minimal OffloadingConnectorScheduler with the SWA-group
+    config that reproduces the 129-vs-128 geometry, calls the production
+    update_state_after_alloc, and verifies:
+
+      1. Correct bound (max_pending_gpu_blocks=3) produces a load job
+         and no assertion.
+      2. Historical wrong bound (max_pending_gpu_blocks=2) raises
+         AssertionError (negative control).
+
+    Blocks layout for gpu_bs=4, sw=7, num_cached_tokens=13:
+      num_gpu_blocks = cdiv(13, 4) = 4
+      skipped_tokens = max(0, 13-7+1)//4 = 1
+      block 0: null (skipped)
+      blocks 1-3: non-null, no block_hash (cold SWA)
+      → num_locally_computed_gpu_blocks = 1  (first non-null without hash)
+      → num_pending = 4 - 1 = 3
+      → correct bound 3 >= 3 passes; old bound 2 < 3 fails
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
+        OffloadingEventGroupSpec,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        GroupOffloadConfig,
+        OffloadingConnectorScheduler,
+        RequestGroupState,
+        RequestOffloadState,
+        SchedulerOffloadConfig,
+    )
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.kv_cache_interface import KVCacheSpecKind
+    from vllm.v1.kv_offload.base import (
+        GPULoadStoreSpec,
+        OffloadingManager,
+        ReqContext,
+        RequestOffloadingContext,
+        make_offload_key,
+    )
+
+    _SWA_EVENT_SPEC = OffloadingEventGroupSpec(
+        kv_cache_spec_kind=KVCacheSpecKind.SLIDING_WINDOW.value,
+        kv_cache_spec_sliding_window=7,
+    )
+
+    gpu_bs = 4
+
+    for max_pending, expect_assert in [(3, False), (2, True)]:
+        group_config = GroupOffloadConfig(
+            group_idx=0,
+            gpu_block_size=gpu_bs,
+            offloaded_block_size=gpu_bs,
+            hash_block_size_factor=1,
+            sliding_window_size_in_blocks=2,  # ceil(7/4)
+            max_pending_gpu_blocks=max_pending,
+            alignment_block_count=None,
+            is_eagle_group=False,
+            kv_event_group_spec=_SWA_EVENT_SPEC,
+        )
+        config = SchedulerOffloadConfig(
+            kv_group_configs=(group_config,),
+            block_size_factor=1,
+            num_workers=1,
+            offload_prompt_only=False,
+        )
+
+        # Create scheduler with __new__ to skip __init__.
+        sched = OffloadingConnectorScheduler.__new__(OffloadingConnectorScheduler)
+        sched.config = config
+        sched.manager = MagicMock(spec=OffloadingManager)
+        # prepare_load returns a real empty GPULoadStoreSpec.
+        mock_load_spec = GPULoadStoreSpec(
+            block_ids=[], group_sizes=[], block_indices=[]
+        )
+        sched.manager.prepare_load = MagicMock(return_value=mock_load_spec)
+        sched._current_batch_allocated_block_ids = set()
+        sched._current_batch_load_jobs = {}
+        sched._jobs = {}
+        sched._blocks_being_loaded = set()
+        sched._job_counter = 0
+
+        def _gen_job_id(scheduler=sched):
+            jid = scheduler._job_counter
+            scheduler._job_counter += 1
+            return jid
+
+        sched._generate_job_id = _gen_job_id
+
+        # Set up request state.
+        req_id = "test-001"
+        req = MagicMock()
+        req.request_id = req_id
+        mock_req_ctx = ReqContext(req_id=req_id, kv_transfer_params={})
+
+        group_state = RequestGroupState(
+            offload_keys=[make_offload_key(str(i).encode(), 0) for i in range(4)],
+            block_ids=[],
+            next_stored_block_idx=0,
+            num_hit_blocks=0,
+        )
+        req_status = RequestOffloadState.__new__(RequestOffloadState)
+        req_status.config = config
+        req_status.req = req
+        req_status.req_context = mock_req_ctx
+        req_status.offloading_context = RequestOffloadingContext()
+        req_status.group_states = (group_state,)
+        req_status.num_locally_computed_tokens = 0
+        req_status.transfer_jobs = set()
+        req_status.deferred_lookup_start_time = None
+
+        sched._req_status = {req_id: req_status}
+
+        # Build KVCacheBlocks for the SWA group.
+        # 4 GPU blocks: block 0 = null (skipped), blocks 1-3 = non-null no hash.
+        blocks = KVCacheBlocks((
+            [
+                KVCacheBlock(block_id=0, is_null=True),
+                KVCacheBlock(block_id=1, is_null=False),
+                KVCacheBlock(block_id=2, is_null=False),
+                KVCacheBlock(block_id=3, is_null=False),
+            ],
+        ))
+
+        if expect_assert:
+            with pytest.raises(AssertionError, match="max_pending_gpu_blocks=2"):
+                sched.update_state_after_alloc(
+                    req, blocks, num_external_tokens=13
+                )
+        else:
+            sched.update_state_after_alloc(
+                req, blocks, num_external_tokens=13
+            )
+            assert sched._current_batch_load_jobs, (
+                f"max_pending={max_pending}: no load job created"
+            )
+            assert sched._blocks_being_loaded
+
+    assert max_sliding_window_gpu_block_span(7, 4) == 3
+    assert max_sliding_window_gpu_block_span(4096, 32) == 129

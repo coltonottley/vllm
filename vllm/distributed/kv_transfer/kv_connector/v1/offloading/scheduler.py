@@ -87,6 +87,11 @@ class GroupOffloadConfig(NamedTuple):
     kv_event_group_spec: OffloadingEventGroupSpec
     # None below means full attention
     sliding_window_size_in_blocks: int | None
+    # Pre-computed upper bound on `num_pending_gpu_blocks` for this group.
+    #   SlidingWindowSpec → max_sliding_window_gpu_block_span(...)
+    #   MambaSpec         → sliding_window_size_in_blocks * block_size_factor
+    #   FullAttentionSpec → None (no constraint)
+    max_pending_gpu_blocks: int | None = None
     # Number of this group's offloaded blocks per full-attention alignment
     # segment. Used to skip storing SWA blocks that can never serve a load
     # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
@@ -132,6 +137,30 @@ def get_sliding_window_size_in_blocks(
 
     assert isinstance(kv_cache_spec, FullAttentionSpec)
     return None
+
+
+def max_sliding_window_gpu_block_span(
+    sliding_window_tokens: int, gpu_block_size: int
+) -> int:
+    """Maximum number of physical GPU blocks that can intersect a sliding
+    window of *sliding_window_tokens* consecutive token positions.
+
+    The sliding window spans *sliding_window_tokens* token positions.  At
+    worst the first window token sits 1 past a GPU-block boundary and the
+    last window token sits 1 before the next boundary, so the window can
+    overlap one more GPU block than ceil(window / gpu_block_size)
+    predicts.
+
+    Formula: ceil((sliding_window_tokens + gpu_block_size - 1) /
+                   gpu_block_size)
+
+    This is the correct upper bound for the number of GPU blocks that
+    can have pending (externally-loaded) data for a sliding-window
+    attention group; the earlier approximation
+    ceil(window / (gpu_block_size * block_size_factor)) * block_size_factor
+    undercounts by one GPU block when partial first/last blocks exist.
+    """
+    return cdiv(sliding_window_tokens + gpu_block_size - 1, gpu_block_size)
 
 
 def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
@@ -232,6 +261,18 @@ class SchedulerOffloadConfig(NamedTuple):
                             spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
                             gpu_block_size * spec.block_size_factor,
                         )
+                    ),
+                    max_pending_gpu_blocks=(
+                        max_sliding_window_gpu_block_span(
+                            spec.kv_cache_config.kv_cache_groups[idx]
+                            .kv_cache_spec.sliding_window,
+                            gpu_block_size,
+                        )
+                        if isinstance(
+                            spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
+                            SlidingWindowSpec,
+                        )
+                        else (sw * spec.block_size_factor if sw is not None else None)
                     ),
                     alignment_block_count=_alignment_block_count(
                         gpu_block_size * spec.block_size_factor, sw
@@ -952,11 +993,15 @@ class OffloadingConnectorScheduler:
             )
             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
 
-            if group_config.sliding_window_size_in_blocks is not None:
+            if group_config.max_pending_gpu_blocks is not None:
                 assert (
                     num_pending_gpu_blocks
-                    <= group_config.sliding_window_size_in_blocks
-                    * self.config.block_size_factor
+                    <= group_config.max_pending_gpu_blocks
+                ), (
+                    f"SWA/Mamba pending {num_pending_gpu_blocks} exceeds "
+                    f"max_pending_gpu_blocks="
+                    f"{group_config.max_pending_gpu_blocks} "
+                    f"(gpu_bs={group_config.gpu_block_size})"
                 )
 
             num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
