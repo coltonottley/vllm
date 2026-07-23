@@ -117,6 +117,28 @@ class SharedOffloadRegion:
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
 
+    # ------------------------------------------------------------------ #
+    # Read-only accessors for the backing storage
+    # ------------------------------------------------------------------ #
+
+    @property
+    def base_tensor(self) -> torch.Tensor | None:
+        """Return the full int8 tensor over the mmap-backed storage.
+
+        Returns ``None`` after :meth:`cleanup` has been called.
+        """
+        return self._base
+
+    @property
+    def base_ptr(self) -> int:
+        """Data pointer (byte address) of the backing storage, or 0 after cleanup.
+
+        Equivalent to ``base_tensor.data_ptr()`` when the region is active.
+        """
+        if self._base is None:
+            return 0
+        return self._base.data_ptr()
+
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
 
