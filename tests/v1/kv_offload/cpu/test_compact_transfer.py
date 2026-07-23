@@ -32,7 +32,7 @@ def _identity_mapping(
 
     Single-fragment identity run — canonical == local — covering the full
     page.  When *store_runs* is provided (e.g. empty tuple for non-writer),
-    it replaces the default identity store run.
+    it replaces the default identity store run exactly.
     """
     run = MappedRun(
         local_offset=0,
@@ -42,15 +42,11 @@ def _identity_mapping(
         local_stride=page_size,
         canonical_stride=page_size,
     )
-    s_runs = run if store_runs is None else store_runs
-    if store_runs is not None and len(store_runs) == 0:
-        s_runs = ()
-    else:
-        s_runs = (run,)
+    s_runs = (run,) if store_runs is None else store_runs
     return CanonicalPageMapping(
         canonical_page_size_bytes=page_size,
         local_page_size_bytes=page_size,
-        store_runs=() if s_runs is None or len(s_runs) == 0 else (run,),
+        store_runs=s_runs,
         load_runs=(run,),
         parallel_invariant=True,
     )
@@ -253,6 +249,38 @@ class TestPlanCompactTransfer:
         )
         assert int(plan.gpu_ptrs[0]) == 10000  # k at base
         assert int(plan.gpu_ptrs[1]) == 12048  # v at base + 2048
+
+    def test_identity_mapping_custom_store_runs(self):
+        """_identity_mapping preserves caller-supplied nonidentity store_runs
+        and defaults to identity run only when store_runs is None.
+
+        Regression: the helper historically discarded a non-``None``
+        nonempty *store_runs* by overwriting it with the default identity
+        run.
+        """
+        custom_run = MappedRun(
+            local_offset=10,
+            canonical_offset=20,
+            fragment_size=100,
+            num_fragments=1,
+            local_stride=100,
+            canonical_stride=100,
+        )
+        # Nonidentity store_runs preserved exactly
+        mapping = _identity_mapping(4096, store_runs=(custom_run,))
+        assert mapping.store_runs == (custom_run,), (
+            f"Expected {custom_run}, got {mapping.store_runs}"
+        )
+        # Default (None) produces identity store run
+        default_mapping = _identity_mapping(4096)
+        assert len(default_mapping.store_runs) == 1
+        assert default_mapping.store_runs[0].fragment_size == 4096
+        assert default_mapping.store_runs[0].local_offset == 0
+        # Empty tuple for non-writer
+        empty_mapping = _identity_mapping(4096, store_runs=())
+        assert empty_mapping.store_runs == (), (
+            f"Expected empty tuple, got {empty_mapping.store_runs}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +613,90 @@ class TestDirection:
         # that were allocated, even when no descriptors are generated.
         assert plan.num_cpu_addresses == 1
 
+    def test_mixed_writer_nonwriter_store(self):
+        """Store with mixed writer/nonwriter layers: only writer-layer descriptors
+        in store plan; load plan still includes both layers."""
+        # Layer 0: writer with one 4096-byte store run
+        writer_run = MappedRun(0, 0, 4096, 1, 4096, 4096)
+        writer_mapping = CanonicalPageMapping(
+            4096,
+            4096,
+            (writer_run,),
+            (writer_run,),
+            True,
+        )
+        # Layer 1: non-writer (empty store_runs)
+        reader_run = MappedRun(0, 0, 4096, 1, 4096, 4096)
+        nonwriter_mapping = CanonicalPageMapping(
+            4096,
+            4096,
+            (),
+            (reader_run,),
+            True,
+        )
+        mappings = (writer_mapping, nonwriter_mapping)
+        offsets = (0, 4096)
+        gpu_offsets = (0, 0)
+
+        gpu_block_ids = np.array([0], dtype=np.int64)
+        address = _make_address(0, 8192, group_idx=0)
+
+        # Store direction: only writer layer produces descriptors
+        store_plan = plan_compact_transfer(
+            gpu_base_ptr=10000,
+            gpu_row_stride=8192,
+            cpu_base_ptr=0,
+            cpu_region_size=65536,
+            gpu_block_ids=gpu_block_ids,
+            group_sizes=[1],
+            block_indices=[0],
+            compact_addresses=[address],
+            per_group_mappings=[mappings],
+            per_group_canonical_offsets=[offsets],
+            per_group_gpu_offsets=[gpu_offsets],
+            blocks_per_chunk=1,
+            direction="store",
+        )
+        # Only 1 descriptor (writer layer K at canonical offset 0)
+        assert store_plan.num_descriptors == 1, (
+            f"Expected 1 writer descriptor, got {store_plan.num_descriptors}"
+        )
+        assert store_plan.num_bytes == 4096
+        assert int(store_plan.cpu_ptrs[0]) == 0  # K at canonical offset 0
+
+        # Load direction: both layers produce descriptors
+        load_plan = plan_compact_transfer(
+            gpu_base_ptr=10000,
+            gpu_row_stride=8192,
+            cpu_base_ptr=0,
+            cpu_region_size=65536,
+            gpu_block_ids=gpu_block_ids,
+            group_sizes=[1],
+            block_indices=[0],
+            compact_addresses=[address],
+            per_group_mappings=[mappings],
+            per_group_canonical_offsets=[offsets],
+            per_group_gpu_offsets=[gpu_offsets],
+            blocks_per_chunk=1,
+            direction="load",
+        )
+        # Both layers produce descriptors for load
+        assert load_plan.num_descriptors == 2, (
+            f"Expected 2 load descriptors, got {load_plan.num_descriptors}"
+        )
+        assert load_plan.num_bytes == 8192
+        cpu_ranges = [
+            (
+                int(load_plan.cpu_ptrs[i]),
+                int(load_plan.cpu_ptrs[i] + load_plan.sizes[i]),
+            )
+            for i in range(2)
+        ]
+        # Load includes K at [0, 4096) and V at [4096, 8192)
+        # (both layers, though V has no store_runs)
+        assert cpu_ranges[0] == (0, 4096), f"cpu_ranges[0]={cpu_ranges[0]}"
+        assert cpu_ranges[1] == (4096, 8192), f"cpu_ranges[1]={cpu_ranges[1]}"
+
     def test_invalid_direction(self):
         mappings = (_identity_mapping(4096),)
         with pytest.raises(ValueError, match="direction"):
@@ -612,8 +724,8 @@ class TestDirection:
 
 class TestBlocksPerChunk:
     def test_bsf_two_layer_major_ranges(self):
-        """BSF=2: CPU ranges are k0@[0,1024), k1@[1024,2048), v0@[2048,3072),
-        v1@[3072,4096)."""
+        """BSF=2, two layers: descriptor order is [K0,V0,K1,V1] (layer-major).
+        CPU ranges: K0@[0,1024), V0@[1024,2048), K1@[2048,3072), V1@[3072,4096)."""
         run = MappedRun(
             local_offset=0,
             canonical_offset=0,
