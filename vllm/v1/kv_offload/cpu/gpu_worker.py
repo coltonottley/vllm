@@ -293,8 +293,8 @@ class SingleDirectionOffloadingHandler:
     def _submit_descriptors(
         self,
         job_id: int,
-        gpu_ptrs: torch.Tensor,
-        cpu_ptrs: torch.Tensor,
+        src_ptrs: torch.Tensor,
+        dst_ptrs: torch.Tensor,
         sizes: torch.Tensor,
         num_bytes: int,
         is_src_access_order_any: bool = False,
@@ -319,7 +319,7 @@ class SingleDirectionOffloadingHandler:
                 passes ``ops.swap_blocks_batch`` directly to ensure
                 the canonical native op is always used.
         """
-        num_descriptors = gpu_ptrs.numel()
+        num_descriptors = src_ptrs.numel()
 
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
@@ -348,8 +348,8 @@ class SingleDirectionOffloadingHandler:
             if num_descriptors > 0:
                 fn = swap_fn if swap_fn is not None else self._swap_blocks_batch
                 fn(
-                    gpu_ptrs,
-                    cpu_ptrs,
+                    src_ptrs,
+                    dst_ptrs,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                     use_batch_api=use_batch_api,
@@ -364,8 +364,8 @@ class SingleDirectionOffloadingHandler:
                 start_event=start_event,
                 end_event=end_event,
                 num_bytes=num_bytes,
-                batch_src=gpu_ptrs,
-                batch_dst=cpu_ptrs,
+                batch_src=src_ptrs,
+                batch_dst=dst_ptrs,
                 batch_sizes=sizes,
             )
         )
@@ -527,8 +527,8 @@ class SingleDirectionOffloadingHandler:
         if num_descriptors == 0:
             return self._submit_descriptors(
                 job_id=job_id,
-                gpu_ptrs=gpu_ptr_t,
-                cpu_ptrs=cpu_ptr_t,
+                src_ptrs=gpu_ptr_t,
+                dst_ptrs=cpu_ptr_t,
                 sizes=sz_t,
                 num_bytes=num_bytes,
                 is_src_access_order_any=is_src_access_order_any,
@@ -546,14 +546,21 @@ class SingleDirectionOffloadingHandler:
         if batch_src.numel() < num_descriptors:
             batch_src, batch_dst, batch_sizes = _new_descriptor_buffers(num_descriptors)
 
-        batch_src[:num_descriptors].copy_(gpu_ptr_t)
-        batch_dst[:num_descriptors].copy_(cpu_ptr_t)
+        # Explicit direction-based assignment: the native op consumes
+        # positional (src_ptrs, dst_ptrs), not semantic (gpu, cpu).
+        # Store copies GPU→CPU; load copies CPU→GPU.
+        if self.gpu_to_cpu:
+            batch_src[:num_descriptors].copy_(gpu_ptr_t)
+            batch_dst[:num_descriptors].copy_(cpu_ptr_t)
+        else:
+            batch_src[:num_descriptors].copy_(cpu_ptr_t)
+            batch_dst[:num_descriptors].copy_(gpu_ptr_t)
         batch_sizes[:num_descriptors].copy_(sz_t)
 
         return self._submit_descriptors(
             job_id=job_id,
-            gpu_ptrs=batch_src[:num_descriptors],
-            cpu_ptrs=batch_dst[:num_descriptors],
+            src_ptrs=batch_src[:num_descriptors],
+            dst_ptrs=batch_dst[:num_descriptors],
             sizes=batch_sizes[:num_descriptors],
             num_bytes=num_bytes,
             is_src_access_order_any=is_src_access_order_any,
@@ -699,8 +706,8 @@ class SingleDirectionOffloadingHandler:
         is_src_access_order_any = not self.gpu_to_cpu
         return self._submit_descriptors(
             job_id=job_id,
-            gpu_ptrs=src,
-            cpu_ptrs=dst,
+            src_ptrs=src,
+            dst_ptrs=dst,
             sizes=sizes,
             num_bytes=num_transfer_bytes,
             is_src_access_order_any=is_src_access_order_any,
