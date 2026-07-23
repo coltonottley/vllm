@@ -31,7 +31,10 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadingWorker,
 )
-from vllm.v1.kv_offload.cpu.common import derive_compact_group_geometry
+from vllm.v1.kv_offload.cpu.common import (
+    CompactRankEvidence,
+    derive_compact_group_geometry,
+)
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.sharding import derive_canonical_mappings
 
@@ -63,8 +66,37 @@ class OffloadingConnectorWorker:
         ] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
+        # Compact rank evidence: derived once from geometry, sent once.
+        self._compact_rank_evidence: CompactRankEvidence | None = None
+        self._compact_evidence_sent: bool = False
+
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
+
+    def _configure_compact_geometry_and_evidence(
+        self,
+        geometry: tuple,
+    ) -> None:
+        assert isinstance(self.worker, CPUOffloadingWorker)
+        self.worker.configure_compact_geometry(geometry)
+        if not self.spec.compact_layout_requested:
+            return
+        is_writer = any(
+            layer.mapping.store_runs
+            for group in geometry
+            if group is not None
+            for layer in group.layers
+        )
+        self._is_store_writer = is_writer
+        self._compact_rank_evidence = CompactRankEvidence.from_geometry(
+            rank=self.spec.config.parallel.rank,
+            world_size=self.spec.config.parallel.world_size,
+            geometry=geometry,
+            page_size=self.spec.compact_page_size,
+            cpu_bytes_to_use=self.spec.compact_storage_budget_bytes,
+            blocks_per_chunk=self.spec.blocks_per_chunk,
+            is_writer=is_writer,
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
@@ -176,7 +208,7 @@ class OffloadingConnectorWorker:
                 compact_geometry = derive_compact_group_geometry(
                     kv_cache_config, mappings, kv_caches, layer_is_packed
                 )
-                self.worker.configure_compact_geometry(compact_geometry)
+                self._configure_compact_geometry_and_evidence(compact_geometry)
             return
 
         block_tensors: list[CanonicalKVCacheTensor] = []
@@ -250,7 +282,7 @@ class OffloadingConnectorWorker:
             compact_geometry = derive_compact_group_geometry(
                 kv_cache_config, mappings, kv_caches, layer_is_packed
             )
-            self.worker.configure_compact_geometry(compact_geometry)
+            self._configure_compact_geometry_and_evidence(compact_geometry)
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
@@ -391,11 +423,31 @@ class OffloadingConnectorWorker:
         return set(), finished_recving
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
-        """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        """Return completed transfer job IDs since the last call.
+
+        Includes the compact rank evidence exactly once if compact layout
+        is requested.  Subsequent calls return only completed transfer jobs;
+        the evidence is not repeated.
+        """
+        has_completed = bool(self._connector_worker_meta.completed_jobs)
+        has_evidence = (
+            self.spec.compact_layout_requested
+            and self._compact_rank_evidence is not None
+            and not self._compact_evidence_sent
+        )
+        if not has_completed and not has_evidence:
             return None
+
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()
+
+        # Attach compact rank evidence exactly once.
+        if has_evidence:
+            meta.compact_reports.append(
+                (self._compact_rank_evidence.rank, self._compact_rank_evidence)
+            )
+            self._compact_evidence_sent = True
+
         return meta
 
     def shutdown(self) -> None:

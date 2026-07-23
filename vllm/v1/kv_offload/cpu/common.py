@@ -81,6 +81,134 @@ class CompactGroupGeometry:
             )
 
 
+@dataclass(frozen=True)
+class CompactRankEvidence:
+    """Per-rank deterministic scalar evidence for compact consensus.
+
+    Carries the actual values needed for manager activation without
+    hashing them away.  Each rank's evidence is preserved independently
+    so the scheduler can compare per-rank tuples for consistency.
+
+    Fields
+    ------
+    rank:
+        Explicit rank identity of the reporting worker.
+    world_size:
+        Expected world size (validated against parallel config).
+    schema_version:
+        Format version for forward compatibility.
+    group_available:
+        Ordered group availability: True if the group is present and
+        has compact geometry, False if unavailable.  One entry per
+        KV cache group.
+    canonical_bytes:
+        Canonical payload bytes per compact address/chunk.  Available
+        groups have a positive value equal to the group's canonical
+        extent; unavailable groups have 0.
+    page_size:
+        Base page size for compact addressing, derived from canonical
+        config (worker_kv_bytes_per_block * blocks_per_chunk).
+    cpu_bytes_to_use:
+        Budget authority — total CPU byte budget for compact mode.
+    parallel_invariant:
+        True when every available group's mapping is parallel-invariant
+        (the canonical bytes are identical under any parallel configuration
+        with the same block span).
+    is_writer:
+        Writer-load role fact: True if this rank writes (offloads) KV
+        data.  All writer ranks must agree on the same geometry for
+        consensus to succeed.
+    expected_world_size:
+        The world_size this rank expects. Validated against parallel
+        config for consistency.
+    """
+
+    rank: int
+    world_size: int
+    schema_version: int = 1
+    group_available: tuple[bool, ...] = ()
+    canonical_bytes: tuple[int, ...] = ()
+    page_size: int = 0
+    cpu_bytes_to_use: int = 0
+    parallel_invariant: bool = True
+    is_writer: bool = True
+    expected_world_size: int = 0
+
+    def __post_init__(self) -> None:
+        if len(self.group_available) != len(self.canonical_bytes):
+            raise ValueError(
+                f"group_available ({len(self.group_available)}) and "
+                f"canonical_bytes ({len(self.canonical_bytes)}) must have "
+                f"the same length"
+            )
+        for avail, cbytes in zip(self.group_available, self.canonical_bytes):
+            if avail and cbytes <= 0:
+                raise ValueError(
+                    f"available group must have positive canonical_bytes, got {cbytes}"
+                )
+            if not avail and cbytes != 0:
+                raise ValueError(
+                    f"unavailable group must have canonical_bytes=0, got {cbytes}"
+                )
+        if self.page_size <= 0:
+            raise ValueError(f"page_size must be positive, got {self.page_size}")
+        if self.cpu_bytes_to_use <= 0:
+            raise ValueError(
+                f"cpu_bytes_to_use must be positive, got {self.cpu_bytes_to_use}"
+            )
+        if self.expected_world_size <= 0:
+            raise ValueError(
+                f"expected_world_size must be positive, got {self.expected_world_size}"
+            )
+
+    @staticmethod
+    def from_geometry(
+        rank: int,
+        world_size: int,
+        geometry: tuple["CompactGroupGeometry | None", ...],
+        page_size: int,
+        cpu_bytes_to_use: int,
+        blocks_per_chunk: int = 1,
+        is_writer: bool = True,
+    ) -> "CompactRankEvidence":
+        """Build evidence from a worker's CompactGroupGeometry tuple.
+
+        Args:
+            rank: The reporting worker's rank.
+            world_size: The expected world size.
+            geometry: The worker's compact group geometry tuple.
+            page_size: Base page size for compact addressing.
+            cpu_bytes_to_use: Total CPU byte budget.
+            blocks_per_chunk: Native GPU blocks represented by one offload key.
+            is_writer: Whether this rank is a writer.
+
+        Returns:
+            A CompactRankEvidence with per-group availability and
+            canonical payload bytes preserved as scalar values.
+        """
+        group_available = tuple(g is not None for g in geometry)
+        if blocks_per_chunk <= 0:
+            raise ValueError("blocks_per_chunk must be positive")
+        canonical_bytes = tuple(
+            g.canonical_extent * blocks_per_chunk if g is not None else 0
+            for g in geometry
+        )
+        parallel_invariant = all(
+            g is not None and g.parallel_invariant for g in geometry
+        )
+        return CompactRankEvidence(
+            rank=rank,
+            world_size=world_size,
+            group_available=group_available,
+            canonical_bytes=canonical_bytes,
+            page_size=page_size,
+            cpu_bytes_to_use=cpu_bytes_to_use,
+            parallel_invariant=parallel_invariant,
+            is_writer=is_writer,
+            expected_world_size=world_size,
+        )
+
+
 def derive_compact_group_geometry(
     kv_cache_config: "KVCacheConfig",
     mappings: dict[str, "CanonicalPageMapping"],

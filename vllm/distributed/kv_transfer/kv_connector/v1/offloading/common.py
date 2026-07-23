@@ -7,6 +7,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 from vllm.v1.kv_offload.base import LoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import CompactRankEvidence
 
 ReqId = str
 
@@ -80,10 +81,16 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     (load or store). aggregate() sums counts across workers within a step.
     The scheduler accumulates across steps and processes
     a transfer completion only when count reaches num_workers.
+
+    ``compact_reports`` is a list of (rank, CompactRankEvidence) tuples,
+    preserving every explicit report including duplicates through transport.
+    The scheduler sees the full sequence and resolves duplicates to legacy.
+    aggregate() appends all entries — it does not raise on duplicate ranks.
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
+    compact_reports: list[tuple[int, CompactRankEvidence]] = field(default_factory=list)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -98,7 +105,14 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
+        # Append all compact reports preserving duplicates through transport.
+        # The scheduler sees the full sequence including duplicates and
+        # unresolved rank collisions, and resolves them to permanent legacy.
+        reports = list(self.compact_reports)
+        reports.extend(other.compact_reports)
+
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            compact_reports=reports,
         )
