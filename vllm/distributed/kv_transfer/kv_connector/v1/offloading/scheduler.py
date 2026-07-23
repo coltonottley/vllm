@@ -1548,10 +1548,8 @@ class OffloadingConnectorScheduler:
         all_expected = (1 << self._compact_expected_ranks) - 1
 
         for rank, evidence in meta.compact_reports:
-            rank_bit = 1 << rank
-
-            # ---- validate rank bounds ----
-            if rank_bit & ~all_expected:
+            # ---- validate rank bounds before bit shifting ----
+            if rank < 0 or rank >= self._compact_expected_ranks:
                 logger.warning(
                     "Compact evidence from unexpected rank %d "
                     "(expected 0..%d) — rejecting",
@@ -1559,6 +1557,18 @@ class OffloadingConnectorScheduler:
                     self._compact_expected_ranks - 1,
                 )
                 return self._resolve_compact_fail()
+
+            # ---- reject tuple key rank != evidence.rank ----
+            if rank != evidence.rank:
+                logger.warning(
+                    "Compact evidence tuple key rank %d != evidence.rank %d "
+                    "— rejecting",
+                    rank,
+                    evidence.rank,
+                )
+                return self._resolve_compact_fail()
+
+            rank_bit = 1 << rank
 
             # ---- no duplicate rank ----
             if rank_bit & self._compact_report_rank_mask:
@@ -1568,12 +1578,50 @@ class OffloadingConnectorScheduler:
                 )
                 return self._resolve_compact_fail()
 
+            # ---- validate parallel_invariant ----
+            if not evidence.parallel_invariant:
+                logger.warning(
+                    "Compact evidence from rank %d has "
+                    "parallel_invariant=False — resolving to legacy",
+                    rank,
+                )
+                return self._resolve_compact_fail()
+
+            # ---- validate role_mapping_valid ----
+            if not evidence.role_mapping_valid:
+                logger.warning(
+                    "Compact evidence from rank %d has "
+                    "role_mapping_valid=False — resolving to legacy",
+                    rank,
+                )
+                return self._resolve_compact_fail()
+
             # ---- preserve independently ----
             self._compact_reports[rank] = evidence
 
-            # ---- validate evidence present ----
-            if evidence is None:
-                logger.warning("Rank %d compact evidence is None — rejecting", rank)
+            # ---- reject unsupported schema version ----
+            if evidence.schema_version != 2:
+                logger.warning(
+                    "Compact evidence from rank %d has schema_version=%d "
+                    "(expected 2) — rejecting",
+                    rank,
+                    evidence.schema_version,
+                )
+                return self._resolve_compact_fail()
+
+            # ---- validate evidence world size against scheduler authority ----
+            if (
+                evidence.world_size != self._compact_expected_ranks
+                or evidence.expected_world_size != self._compact_expected_ranks
+            ):
+                logger.warning(
+                    "Compact evidence from rank %d has world_size=%d, "
+                    "expected_world_size=%d (scheduler expects %d) — rejecting",
+                    rank,
+                    evidence.world_size,
+                    evidence.expected_world_size,
+                    self._compact_expected_ranks,
+                )
                 return self._resolve_compact_fail()
 
             # ---- validate unavailable/unresolved group -> legacy ----
@@ -1678,6 +1726,17 @@ class OffloadingConnectorScheduler:
                     )
                     return self._resolve_compact_fail()
 
+                # ---- compare role-neutral geometry signature ----
+                if evidence.signature != baseline.signature:
+                    logger.warning(
+                        "Compact geometry signature mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.signature,
+                        baseline.signature,
+                    )
+                    return self._resolve_compact_fail()
+
             # ---- accumulate ----
             self._compact_report_rank_mask |= rank_bit
 
@@ -1725,10 +1784,19 @@ class OffloadingConnectorScheduler:
 
         Evidence must carry ordered positive per-group compact payload
         bytes sufficient for manager activation.
+
+        Does NOT set ``_compact_resolved`` before validation and manager
+        activation.  If the manager raises (unsupported or activation
+        invariant), the exception propagates and ``_compact_resolved``
+        remains False so stores stay blocked.
+
+        Raises:
+            NotImplementedError: If the manager does not support compact
+                mode.
+            RuntimeError: If manager activation invariants are not met.
         """
         if self._compact_resolved:
             return
-        self._compact_resolved = True
 
         # Use the baseline evidence (first reporting rank) for geometry.
         assert self._compact_baseline is not None
@@ -1739,41 +1807,59 @@ class OffloadingConnectorScheduler:
             self._compact_expected_ranks,
         )
 
-        # Derive total_bytes from agreed scalar evidence (cpu_bytes_to_use).
+        # ---- validate scalar evidence before manager call ----
+
         total_bytes = baseline.cpu_bytes_to_use
         if total_bytes <= 0:
             logger.error(
                 "Compact consensus: cpu_bytes_to_use=%d is not positive — "
-                "cannot enable compact mode",
+                "resolving to legacy",
                 total_bytes,
             )
-            return
+            return self._resolve_compact_fail()
 
-        # Derive page_size from baseline evidence (agreed across ranks).
         page_size = baseline.page_size
         if page_size <= 0:
             logger.error(
-                "Compact consensus: page_size=%d is not positive — "
-                "cannot enable compact mode",
+                "Compact consensus: page_size=%d is not positive — resolving to legacy",
                 page_size,
             )
-            return
+            return self._resolve_compact_fail()
 
         # Build per-group payload bytes map from ordered canonical_bytes.
-        # All available groups have positive canonical_bytes (validated
-        # above).  group_idx maps position in the ordered tuple.
         group_payload_bytes: dict[int, int] = {
             idx: int(cb) for idx, cb in enumerate(baseline.canonical_bytes)
         }
 
+        if not group_payload_bytes:
+            logger.error(
+                "Compact consensus: no available groups — resolving to legacy",
+            )
+            return self._resolve_compact_fail()
+
+        nonpositive = [k for k, v in group_payload_bytes.items() if v <= 0]
+        if nonpositive:
+            logger.error(
+                "Compact consensus: nonpositive canonical_bytes for "
+                "groups %s — resolving to legacy",
+                nonpositive,
+            )
+            return self._resolve_compact_fail()
+
         preferred_groups = self._compact_preferred_groups
 
+        # Activate the manager.  If enable_compact raises (unsupported or
+        # activation invariant), _compact_resolved remains False and the
+        # exception propagates — stores stay blocked.
         self.manager.enable_compact(
             total_bytes=total_bytes,
             page_size=page_size,
             key_sizes=group_payload_bytes,
             preferred_groups=preferred_groups,
         )
+
+        # Only mark resolved after successful manager activation.
+        self._compact_resolved = True
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None

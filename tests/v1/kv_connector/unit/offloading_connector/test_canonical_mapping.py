@@ -651,6 +651,9 @@ def test_sliding_window_mla_fail_closed():
     # Wrong outer dim (num_blocks mismatch)
     wrong_blocks = torch.zeros(NUM_BLOCKS + 1, 4, 64, dtype=torch.int8)
     assert _try_mapping(spec, wrong_blocks, _ctx(0, tp=2, total=1)) is None
+    # Per-token-head quant (fp8 per-token-head scales) fails closed
+    quant_spec = _swa_mla_spec(kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD)
+    assert _try_mapping(quant_spec, good, _ctx(0, tp=2, total=1)) is None
 
 
 # ---------------------------------------------------------------------------

@@ -50,6 +50,27 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "dropped due to insufficient capacity."
                 ),
             ),
+            CPUOffloadingMetrics.CPU_ALLOCATED_BYTES: OffloadingGaugeMetadata(
+                documentation=(
+                    "Exact bytes currently resident in compact CPU KV storage. "
+                    "Zero in legacy (non-compact) mode."
+                ),
+            ),
+            CPUOffloadingMetrics.CPU_FREE_BYTES: OffloadingGaugeMetadata(
+                documentation="Exact free bytes in compact CPU KV storage.",
+            ),
+            CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "Largest contiguous free extent in compact CPU KV storage."
+                    ),
+                )
+            ),
+            CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO: OffloadingGaugeMetadata(
+                documentation=(
+                    "External fragmentation ratio of compact CPU KV free space."
+                ),
+            ),
             CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(
                     "Fraction of CPU KV-cache space currently pinned by "
@@ -303,11 +324,6 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         assert self._worker is not None
         return self._worker
-
-    def shutdown_worker_region(self) -> None:
-        if self._worker_shared_region is not None:
-            self._worker_shared_region.cleanup()
-            self._worker_shared_region = None
 
 
 def _is_preferred_eviction_group(group: KVCacheGroupSpec) -> bool:

@@ -96,6 +96,11 @@ class CPUOffloadingManager(OffloadingManager):
         self._compact_key_sizes: dict[int, int] = {}
         self._compact_page_size: int = 0
         self._compact_total_bytes: int = 0
+        # Pending-store byte counter for compact-mode write-usage observability.
+        # Incremented when a compact store key is committed to the allocator
+        # (before the data transfer completes).  Decremented on successful or
+        # failed complete_store.  Reset to zero in reset_cache.
+        self._compact_pending_store_bytes: int = 0
         # key -> PageAllocation (backing storage)
         self._compact_allocation_by_key: dict[OffloadKey, PageAllocation] = {}
         # key -> CompactCPUAddress (byte-level spec)
@@ -587,6 +592,11 @@ class CPUOffloadingManager(OffloadingManager):
 
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
         if not keys_to_store:
+            # Commit skipped count for a successful no-op filter (all keys
+            # were filtered by threshold).  Do NOT increment on allocator
+            # or transaction failure — stronger failed-transaction atomicity.
+            if skipped_count > 0:
+                self.stores_skipped_in_current_batch += skipped_count
             return PrepareStoreOutput(
                 keys_to_store=[],
                 store_spec=self._get_load_store_spec([], []),
@@ -612,10 +622,24 @@ class CPUOffloadingManager(OffloadingManager):
             def _can_fit(
                 candidates: list[tuple[OffloadKey, "BlockStatus"]],
             ) -> bool:
-                """Predicate: do candidates free enough bytes?"""
+                """Predicate: do candidates free enough bytes after replay closure?
+
+                Evaluates the actual replay-closure-aware eviction plan rather
+                than summing raw candidate bytes, preventing false-positive fit
+                when shared keys survive because another unit still owns them.
+                Non-mutating: ``_replay_eviction_plan`` is read-only.
+                """
+                candidate_keys = [k for k, _ in candidates]
+                evict_keys, _ = self._replay_eviction_plan(
+                    candidate_keys, protected=protected
+                )
+                # Protected keys should never appear in eviction set
+                # (fail-closed sanity check).
+                if any(k in protected for k in evict_keys):
+                    return False
                 freed = 0
-                for key, _ in candidates:
-                    alloc = self._compact_allocation_by_key.get(key)
+                for k in evict_keys:
+                    alloc = self._compact_allocation_by_key.get(k)
                     if alloc is not None:
                         freed += alloc.allocated_length
                     if freed >= bytes_needed:
@@ -653,14 +677,14 @@ class CPUOffloadingManager(OffloadingManager):
 
         # --- Atomic replace: call BEFORE any counter/event/policy/replay/
         #     address/block-id mutation ---
-        try:
-            new_allocations = self._compact_allocator.atomic_replace(
-                frees=victim_allocs,
-                new_sizes=new_sizes,
-            )
-        except Exception:
-            # Exception before any commit: state is byte/structurally unchanged.
-            return None
+        # Exceptions propagate directly: allocator raises ValueError for
+        # invariant/foreign/stale inputs and RuntimeError (test hook) for
+        # injected faults before swap. None means ordinary no-fit with no
+        # state change.
+        new_allocations = self._compact_allocator.atomic_replace(
+            frees=victim_allocs,
+            new_sizes=new_sizes,
+        )
 
         if new_allocations is None:
             # None before any commit: state is byte/structurally unchanged.
@@ -708,6 +732,8 @@ class CPUOffloadingManager(OffloadingManager):
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
         self._num_write_pending_blocks += len(keys_to_store)
+        # Track compact pending-store bytes for write-usage observability.
+        self._compact_pending_store_bytes += sum(new_sizes)
 
         # Record replay unit ownership for cross-group coherence.
         if req_context.store_replay_unit:
@@ -744,19 +770,41 @@ class CPUOffloadingManager(OffloadingManager):
             for key in keys:
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:
-                    block.ref_cnt = 0
-                    self._num_write_pending_blocks -= 1
+                    if self._compact_enabled:
+                        ks = self._get_key_size(key)
+                        assert self._compact_pending_store_bytes >= ks, (
+                            f"compact pending-byte underflow: "
+                            f"{self._compact_pending_store_bytes} < {ks}"
+                        )
+                        self._compact_pending_store_bytes -= ks
+                        self._num_write_pending_blocks -= 1
+                    else:
+                        self._num_write_pending_blocks -= 1
                     self._num_evictable_cache_blocks += 1
+                    block.ref_cnt = 0
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
         else:
+            # Remove the entire failed replay unit so no phantom ownership
+            # remains.  Keys shared with other (completed) units keep only
+            # their legitimate owners; keys unique to this unit lose their
+            # reverse mapping entirely.  This must happen before per-key
+            # policy/allocation cleanup so that the unit is removed
+            # exactly once regardless of how many keys are passed.
+            self._commit_replay_eviction([], [req_context.req_id])
             for key in keys:
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:
+                    if self._compact_enabled:
+                        ks = self._get_key_size(key)
+                        assert self._compact_pending_store_bytes >= ks, (
+                            f"compact pending-byte underflow: "
+                            f"{self._compact_pending_store_bytes} < {ks}"
+                        )
+                        self._compact_pending_store_bytes -= ks
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
                     self._free_compact_block(key, block)
-                    self._remove_key_from_replay_units(key)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -780,6 +828,7 @@ class CPUOffloadingManager(OffloadingManager):
             self._compact_allocation_by_key.clear()
             self._compact_address_by_key.clear()
             self._compact_block_id_by_key.clear()
+            self._compact_pending_store_bytes = 0
             self._replay_units.clear()
             self._key_replay_units.clear()
 
@@ -797,8 +846,18 @@ class CPUOffloadingManager(OffloadingManager):
 
         if self._compact_enabled:
             alloc = self._compact_allocator
+            allocated_bytes = alloc.used_bytes
             usage = (
-                alloc.used_bytes / alloc.total_bytes if alloc.total_bytes > 0 else 0.0
+                allocated_bytes / alloc.total_bytes if alloc.total_bytes > 0 else 0.0
+            )
+            stats.set_gauge(CPUOffloadingMetrics.CPU_FREE_BYTES, alloc.free_bytes)
+            stats.set_gauge(
+                CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES,
+                alloc.largest_free_block,
+            )
+            stats.set_gauge(
+                CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO,
+                alloc.fragmentation,
             )
         else:
             # Compute cache usage from legacy block pool.
@@ -808,8 +867,10 @@ class CPUOffloadingManager(OffloadingManager):
                 - self._num_evictable_cache_blocks
             )
             usage = num_used / self._num_blocks if self._num_blocks > 0 else 0.0
+            allocated_bytes = 0
 
         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
+        stats.set_gauge(CPUOffloadingMetrics.CPU_ALLOCATED_BYTES, allocated_bytes)
 
         for allocation_size in self.allocation_sizes_in_current_batch:
             stats.observe_histogram(
@@ -819,18 +880,26 @@ class CPUOffloadingManager(OffloadingManager):
 
         if self._compact_enabled:
             alloc = self._compact_allocator
-            total_virtual_blocks = alloc.total_bytes // self._compact_page_size
+            pending_ratio = (
+                self._compact_pending_store_bytes / alloc.total_bytes
+                if alloc.total_bytes > 0
+                else 0.0
+            )
+            stats.set_gauge(
+                CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, pending_ratio
+            )
         else:
             total_virtual_blocks = self._num_blocks
-
-        write_usage = (
-            self._num_write_pending_blocks / total_virtual_blocks
-            if total_virtual_blocks > 0
-            else 0.0
-        )
-        read_usage = max(usage - write_usage, 0.0)
-        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, write_usage)
-        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC, read_usage)
+            write_usage = (
+                self._num_write_pending_blocks / total_virtual_blocks
+                if total_virtual_blocks > 0
+                else 0.0
+            )
+            read_usage = max(usage - write_usage, 0.0)
+            stats.set_gauge(
+                CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, write_usage
+            )
+            stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC, read_usage)
 
         if self.store_threshold >= 2:
             stats.increase_counter(

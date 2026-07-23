@@ -81,6 +81,80 @@ class CompactGroupGeometry:
             )
 
 
+# ---------------------------------------------------------------------------
+# Private nested immutable tuple type aliases for geometry signatures.
+# Explicit nesting preserves group/layer/run boundaries without public
+# dataclass API.
+# ---------------------------------------------------------------------------
+
+# Run: (local_offset, canonical_offset, fragment_size, num_fragments,
+#       local_stride, canonical_stride)
+_CompactRun = tuple[int, int, int, int, int, int]
+
+# Layer: (layer_name, local_page_size_bytes, canonical_page_size_bytes,
+#         canonical_offset, gpu_offset_bytes, runs)
+_CompactLayer = tuple[str, int, int, int, int, tuple[_CompactRun, ...]]
+
+# Group: (present, gpu_row_stride, local_extent, canonical_extent, layers)
+# Unavailable groups use the canonical absent tuple below.
+_CompactGroup = tuple[bool, int, int, int, tuple[_CompactLayer, ...]]
+
+# Canonical absent group signature value.
+_COMPACT_ABSENT_GROUP: _CompactGroup = (False, 0, 0, 0, ())
+
+
+def _compute_geometry_signature(
+    geometry: tuple["CompactGroupGeometry | None", ...],
+) -> tuple[_CompactGroup, ...]:
+    """Deterministic role-neutral geometry signature for cross-rank
+    comparison.
+
+    Returns a nested tuple of private immutable tuple type aliases
+    preserving explicit group/layer/run boundaries.  Uses ``load_runs``
+    (not ``store_runs``) so writer and nonwriter ranks with identical GPU
+    geometry produce the same signature.  Does NOT use ``hash()``, JSON,
+    process-randomized digest, or serialize ``CanonicalPageMapping`` objects.
+    """
+    result: list[_CompactGroup] = []
+    for g in geometry:
+        if g is None:
+            result.append(_COMPACT_ABSENT_GROUP)
+        else:
+            layers: list[_CompactLayer] = []
+            for layer in g.layers:
+                runs: tuple[_CompactRun, ...] = tuple(
+                    (
+                        run.local_offset,
+                        run.canonical_offset,
+                        run.fragment_size,
+                        run.num_fragments,
+                        run.local_stride,
+                        run.canonical_stride,
+                    )
+                    for run in layer.mapping.load_runs
+                )
+                layers.append(
+                    (
+                        layer.layer_name,
+                        layer.local_page_size_bytes,
+                        layer.canonical_page_size_bytes,
+                        layer.canonical_offset,
+                        layer.gpu_offset_bytes,
+                        runs,
+                    )
+                )
+            result.append(
+                (
+                    True,
+                    g.gpu_row_stride,
+                    g.local_extent,
+                    g.canonical_extent,
+                    tuple(layers),
+                )
+            )
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class CompactRankEvidence:
     """Per-rank deterministic scalar evidence for compact consensus.
@@ -121,11 +195,22 @@ class CompactRankEvidence:
     expected_world_size:
         The world_size this rank expects. Validated against parallel
         config for consistency.
+    signature:
+        Role-neutral deterministic geometry signature for cross-rank
+        comparison.  Computed from :meth:`_compute_geometry_signature`
+        at construction.  Must be structurally valid when any group is
+        available: a nonempty tuple of private immutable tuple type
+        aliases with matching ``present`` and length.
+    role_mapping_valid:
+        True when the rank's store/load run mappings are consistent
+        with its writer/nonwriter role.  Valid writer: at least one
+        store run overall AND for every layer store_runs == load_runs.
+        Valid nonwriter: every layer store_runs is empty.
     """
 
     rank: int
     world_size: int
-    schema_version: int = 1
+    schema_version: int = 2
     group_available: tuple[bool, ...] = ()
     canonical_bytes: tuple[int, ...] = ()
     page_size: int = 0
@@ -133,6 +218,8 @@ class CompactRankEvidence:
     parallel_invariant: bool = True
     is_writer: bool = True
     expected_world_size: int = 0
+    signature: tuple[_CompactGroup, ...] = ()
+    role_mapping_valid: bool = True
 
     def __post_init__(self) -> None:
         if len(self.group_available) != len(self.canonical_bytes):
@@ -160,6 +247,57 @@ class CompactRankEvidence:
             raise ValueError(
                 f"expected_world_size must be positive, got {self.expected_world_size}"
             )
+        # Fail-closed: available groups require structurally valid signature.
+        sig = self.signature
+        if any(self.group_available):
+            if not sig:
+                raise ValueError(
+                    "signature must be non-empty when groups are available"
+                )
+            if len(self.group_available) != len(sig):
+                raise ValueError(
+                    f"signature length ({len(sig)}) must match "
+                    f"group_available length ({len(self.group_available)})"
+                )
+            for idx, (avail, sg) in enumerate(zip(self.group_available, sig)):
+                (present, gpu_row_stride, local_extent, canonical_extent, layers) = sg
+                if avail != present:
+                    raise ValueError(
+                        f"available group {idx} present={present} mismatch"
+                    )
+                if avail:
+                    if (
+                        not layers
+                        or gpu_row_stride <= 0
+                        or local_extent <= 0
+                        or canonical_extent <= 0
+                    ):
+                        raise ValueError(
+                            f"available group {idx} invalid scalars or layers"
+                        )
+                    for li, layer in enumerate(layers):
+                        (ln, lps, cps, coff, goff, runs) = layer
+                        if not ln or lps <= 0 or cps <= 0 or coff < 0 or goff < 0:
+                            raise ValueError(f"layer {li} group {idx} invalid fields")
+                        if not runs:
+                            raise ValueError(f"layer {li} group {idx} must have runs")
+                        for ri, run in enumerate(runs):
+                            (lo, co, fs, nf, ls, cs) = run
+                            if (
+                                lo < 0
+                                or co < 0
+                                or fs <= 0
+                                or nf <= 0
+                                or ls <= 0
+                                or cs <= 0
+                            ):
+                                raise ValueError(
+                                    f"run {ri} layer {li} group {idx} invalid"
+                                )
+                elif sg != _COMPACT_ABSENT_GROUP:
+                    raise ValueError(
+                        f"unavailable group {idx} must be canonical absent tuple"
+                    )
 
     @staticmethod
     def from_geometry(
@@ -169,7 +307,7 @@ class CompactRankEvidence:
         page_size: int,
         cpu_bytes_to_use: int,
         blocks_per_chunk: int = 1,
-        is_writer: bool = True,
+        is_writer: bool | None = None,
     ) -> "CompactRankEvidence":
         """Build evidence from a worker's CompactGroupGeometry tuple.
 
@@ -180,11 +318,13 @@ class CompactRankEvidence:
             page_size: Base page size for compact addressing.
             cpu_bytes_to_use: Total CPU byte budget.
             blocks_per_chunk: Native GPU blocks represented by one offload key.
-            is_writer: Whether this rank is a writer.
+            is_writer: Optional override; if provided, must match the derived
+                role from geometry.  Default None means derived from geometry.
 
         Returns:
-            A CompactRankEvidence with per-group availability and
-            canonical payload bytes preserved as scalar values.
+            A CompactRankEvidence with per-group availability,
+            canonical payload bytes, and the role-neutral geometry
+            signature preserved as scalar values.
         """
         group_available = tuple(g is not None for g in geometry)
         if blocks_per_chunk <= 0:
@@ -196,6 +336,48 @@ class CompactRankEvidence:
         parallel_invariant = all(
             g is not None and g.parallel_invariant for g in geometry
         )
+
+        # Derive is_writer from actual store_runs in geometry.
+        derived_is_writer = any(
+            layer.mapping.store_runs
+            for group in geometry
+            if group is not None
+            for layer in group.layers
+        )
+        if is_writer is not None:
+            assert is_writer == derived_is_writer, (
+                f"is_writer={is_writer} does not match derived "
+                f"is_writer={derived_is_writer} from geometry"
+            )
+        else:
+            is_writer = derived_is_writer
+
+        # Compute role-neutral geometry signature.
+        signature = _compute_geometry_signature(geometry)
+
+        # Compute role_mapping_valid from actual mappings.
+        # Valid writer: at least one store run overall AND for every
+        # layer store_runs == load_runs.
+        # Valid nonwriter: every layer store_runs is empty.
+        all_store_eq_load = all(
+            layer.mapping.store_runs == layer.mapping.load_runs
+            for group in geometry
+            if group is not None
+            for layer in group.layers
+        )
+        if derived_is_writer:
+            # Writer requires at least one store run (guaranteed by
+            # derived_is_writer) AND store == load for every layer.
+            role_mapping_valid = all_store_eq_load
+        else:
+            # Nonwriter requires every layer store_runs is empty.
+            role_mapping_valid = all(
+                not layer.mapping.store_runs
+                for group in geometry
+                if group is not None
+                for layer in group.layers
+            )
+
         return CompactRankEvidence(
             rank=rank,
             world_size=world_size,
@@ -206,6 +388,8 @@ class CompactRankEvidence:
             parallel_invariant=parallel_invariant,
             is_writer=is_writer,
             expected_world_size=world_size,
+            signature=signature,
+            role_mapping_valid=role_mapping_valid,
         )
 
 
@@ -334,6 +518,10 @@ def derive_compact_group_geometry(
 class CPUOffloadingMetrics:
     STORES_SKIPPED = "vllm:kv_offload_stores_skipped"
     CPU_CACHE_USAGE_PERC = "vllm:kv_offload_cpu_cache_usage_perc"
+    CPU_ALLOCATED_BYTES = "vllm:kv_offload_cpu_allocated_bytes"
+    CPU_FREE_BYTES = "vllm:kv_offload_cpu_free_bytes"
+    CPU_LARGEST_FREE_EXTENT_BYTES = "vllm:kv_offload_cpu_largest_free_extent_bytes"
+    CPU_FRAGMENTATION_RATIO = "vllm:kv_offload_cpu_fragmentation_ratio"
     CPU_ALLOCATION_SIZE = "vllm:kv_offload_cpu_allocation_size"
     CPU_CACHE_WRITE_USAGE_PERC = "vllm:kv_offload_cpu_cache_write_usage_perc"
     CPU_CACHE_READ_USAGE_PERC = "vllm:kv_offload_cpu_cache_read_usage_perc"

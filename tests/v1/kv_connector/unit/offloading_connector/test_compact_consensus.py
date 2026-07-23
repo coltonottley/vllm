@@ -8,12 +8,16 @@ import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
 )
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadingManager,
+    RequestOffloadingContext,
+)
 from vllm.v1.kv_offload.cpu.common import (
     CompactGroupGeometry,
     CompactLayerGeometry,
     CompactRankEvidence,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -69,7 +73,22 @@ def _make_evidence(
     is_writer: bool = True,
     expected_world_size: int | None = None,
 ) -> CompactRankEvidence:
-    """Build a CompactRankEvidence with explicit fields."""
+    """Build a structurally valid CompactRankEvidence using private immutable
+    tuple type aliases for signatures.
+
+    Callers testing role-mapping or signature rejection must use the raw
+    constructor or ``from_geometry``.
+    """
+    from vllm.v1.kv_offload.cpu.common import _COMPACT_ABSENT_GROUP
+
+    sig_groups = []
+    for avail, cbytes in zip(group_available, canonical_bytes):
+        if avail:
+            run = (0, 0, cbytes, 1, cbytes, cbytes)
+            layer = ("layer.0", cbytes, cbytes, 0, 0, (run,))
+            sig_groups.append((True, cbytes * 2, cbytes, cbytes, (layer,)))
+        else:
+            sig_groups.append(_COMPACT_ABSENT_GROUP)
     return CompactRankEvidence(
         rank=rank,
         world_size=world_size,
@@ -80,6 +99,8 @@ def _make_evidence(
         parallel_invariant=parallel_invariant,
         is_writer=is_writer,
         expected_world_size=expected_world_size or world_size,
+        signature=tuple(sig_groups),
+        role_mapping_valid=True,
     )
 
 
@@ -121,6 +142,65 @@ def _make_scheduler(compact_requested: bool = True, world_size: int = 2):
 def _meta(reports: list[tuple[int, CompactRankEvidence]]) -> OffloadingWorkerMetadata:
     """Build OffloadingWorkerMetadata with compact reports (list of tuples)."""
     return OffloadingWorkerMetadata(compact_reports=reports)
+
+
+# ---------------------------------------------------------------------------
+# Test stubs: concrete OffloadingManager subclass for lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+class _RecordingManager(OffloadingManager):
+    """Records enable_compact calls for verification without side effects."""
+
+    def __init__(self) -> None:
+        self.enable_compact_called: bool = False
+        self.enable_compact_kwargs: dict | None = None
+
+    def enable_compact(
+        self,
+        total_bytes: int,
+        page_size: int = 65536,
+        key_sizes: dict[int, int] | None = None,
+        preferred_groups: tuple[int, ...] | None = None,
+    ) -> None:
+        self.enable_compact_called = True
+        self.enable_compact_kwargs = {
+            "total_bytes": total_bytes,
+            "page_size": page_size,
+            "key_sizes": key_sizes,
+            "preferred_groups": preferred_groups,
+        }
+
+    def lookup(self, key, req_context):  # type: ignore[override]
+        return LookupResult.MISS
+
+    def prepare_load(self, keys, req_context):  # type: ignore[override]
+        return None  # type: ignore[return-value]
+
+    def prepare_store(self, keys, req_context):  # type: ignore[override]
+        return None
+
+    def on_new_request(self, req_context):  # type: ignore[override]
+        return RequestOffloadingContext()
+
+
+class _UnsupportedManager(_RecordingManager):
+    """Concrete manager that deliberately inherits the base fail-loud seam."""
+
+    enable_compact = OffloadingManager.enable_compact
+
+
+class _RaisingManager(_RecordingManager):
+    """Concrete manager whose activation invariant fails."""
+
+    def enable_compact(
+        self,
+        total_bytes: int,
+        page_size: int = 65536,
+        key_sizes: dict[int, int] | None = None,
+        preferred_groups: tuple[int, ...] | None = None,
+    ) -> None:
+        raise RuntimeError("injected compact activation failure")
 
 
 # ===================================================================
@@ -262,6 +342,26 @@ class TestCompactRankEvidence:
                 expected_world_size=2,
             )
 
+    def test_validation_available_no_signature_fails(self):
+        """Available groups with empty signature must fail."""
+        with pytest.raises(ValueError, match="non-empty when groups are available"):
+            CompactRankEvidence(
+                rank=0,
+                world_size=2,
+                group_available=(True,),
+                canonical_bytes=(64,),
+                page_size=65536,
+                cpu_bytes_to_use=10**9,
+                expected_world_size=2,
+                signature=(),
+                role_mapping_valid=True,
+            )
+
+    def test_validation_schema_version_default_two(self):
+        """Default schema_version is 2."""
+        ev = _make_evidence()
+        assert ev.schema_version == 2
+
 
 # ===================================================================
 # OffloadingWorkerMetadata compact report tests
@@ -296,7 +396,6 @@ class TestCompactReportMetadata:
         m1 = OffloadingWorkerMetadata(compact_reports=[(0, dup)])
         agg = m0.aggregate(m1)
         assert len(agg.compact_reports) == 2
-        # Both entries preserved; scheduler resolves duplicates.
         assert agg.compact_reports[0][1].canonical_bytes == (64,)
         assert agg.compact_reports[1][1].canonical_bytes == (64,)
 
@@ -324,13 +423,13 @@ class TestCompactConsensus:
     def sample_evidence(self):
         return _make_evidence(rank=0, canonical_bytes=(64,))
 
+    # --- Core flow ---
+
     def test_disabled_no_report_gate_activation(self):
         """If compact_layout_requested=False: zero report/gate/activation."""
         sched = _make_scheduler(compact_requested=False)
         assert not sched._compact_requested
-        # Gate is bypassed
         assert sched._compact_resolved is False
-        # enable_compact must not be called by any path
         assert hasattr(sched.manager, "enable_compact")
 
     def test_agreement_activates_once(self, sample_evidence):
@@ -338,11 +437,9 @@ class TestCompactConsensus:
         sched = _make_scheduler(world_size=2)
         assert not sched._compact_resolved
 
-        # Rank 0 reports
         sched._process_compact_geometry_report(_meta([(0, sample_evidence)]))
         assert not sched._compact_resolved
 
-        # Rank 1 reports (same evidence)
         ev1 = _make_evidence(rank=1, canonical_bytes=(64,))
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
@@ -353,6 +450,8 @@ class TestCompactConsensus:
         sched._process_compact_geometry_report(_meta([(0, sample_evidence)]))
         assert not sched._compact_resolved
 
+    # --- Scalar conflict rejection ---
+
     def test_conflict_canonical_bytes_fails(self):
         """Canonical bytes mismatch — permanent legacy fallback."""
         sched = _make_scheduler(world_size=2)
@@ -361,7 +460,7 @@ class TestCompactConsensus:
         sched._process_compact_geometry_report(_meta([(0, ev0)]))
         assert not sched._compact_resolved
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
-        assert sched._compact_resolved  # resolved to legacy
+        assert sched._compact_resolved
 
     def test_conflict_group_available_fails(self):
         """Group availability mismatch — permanent legacy fallback."""
@@ -383,16 +482,6 @@ class TestCompactConsensus:
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
 
-    def test_conflict_parallel_invariant_fails(self):
-        """Parallel invariant mismatch — permanent legacy fallback."""
-        sched = _make_scheduler(world_size=2)
-        ev0 = _make_evidence(rank=0, parallel_invariant=True)
-        ev1 = _make_evidence(rank=1, parallel_invariant=False)
-        sched._process_compact_geometry_report(_meta([(0, ev0)]))
-        assert not sched._compact_resolved
-        sched._process_compact_geometry_report(_meta([(1, ev1)]))
-        assert sched._compact_resolved
-
     def test_conflict_world_size_fails(self):
         """Expected world_size mismatch — permanent legacy fallback."""
         sched = _make_scheduler(world_size=2)
@@ -403,22 +492,48 @@ class TestCompactConsensus:
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
 
+    # --- Rank integrity ---
+
     def test_duplicate_rank_fails(self):
         """Duplicate rank report — permanent legacy fallback."""
         sched = _make_scheduler(world_size=2)
         ev = _make_evidence(rank=0)
         sched._process_compact_geometry_report(_meta([(0, ev)]))
         assert not sched._compact_resolved
-        # Same rank reports again
         sched._process_compact_geometry_report(_meta([(0, ev)]))
-        assert sched._compact_resolved  # resolved to legacy
+        assert sched._compact_resolved
 
-    def test_unexpected_rank_fails(self):
-        """Rank beyond expected range — permanent legacy fallback."""
+    @pytest.mark.parametrize("rank", [-1, 99])
+    def test_unexpected_rank_fails(self, rank):
+        """Rank outside expected range — permanent legacy fallback."""
         sched = _make_scheduler(world_size=2)
-        ev = _make_evidence(rank=99)
-        sched._process_compact_geometry_report(_meta([(99, ev)]))
-        assert sched._compact_resolved  # resolved to legacy
+        ev = _make_evidence(rank=rank)
+        sched._process_compact_geometry_report(_meta([(rank, ev)]))
+        assert sched._compact_resolved
+
+    def test_tuple_rank_mismatch_fails(self):
+        """Tuple key rank != evidence.rank — immediate rejection."""
+        sched = _make_scheduler(world_size=2)
+        ev = _make_evidence(rank=0)
+        # Pass with tuple key 1 but evidence.rank 0.
+        sched._process_compact_geometry_report(_meta([(1, ev)]))
+        assert sched._compact_resolved
+
+    @pytest.mark.parametrize(
+        ("world_size", "expected_world_size"), [(4, 2), (2, 4), (4, 4)]
+    )
+    def test_world_size_must_match_scheduler(self, world_size, expected_world_size):
+        """Evidence agreement cannot override scheduler rank authority."""
+        sched = _make_scheduler(world_size=2)
+        ev = _make_evidence(
+            rank=0,
+            world_size=world_size,
+            expected_world_size=expected_world_size,
+        )
+        sched._process_compact_geometry_report(_meta([(0, ev)]))
+        assert sched._compact_resolved
+
+    # --- Once-only ---
 
     def test_consensus_once_only(self, sample_evidence):
         """Already resolved — subsequent reports do not re-activate."""
@@ -427,228 +542,416 @@ class TestCompactConsensus:
         sched._process_compact_geometry_report(_meta([(0, sample_evidence)]))
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
-        # Second call after resolution: duplicate rank triggers fail
-        # but first resolution outcome is authoritative.
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
+
+    # --- Gate release ---
 
     def test_store_gate_released_on_fail(self):
         """After consensus fail, stores flow through legacy path (no crash)."""
         sched = _make_scheduler(world_size=2)
-        # Force fail
         ev_bad = _make_evidence(rank=99)
         sched._process_compact_geometry_report(_meta([(99, ev_bad)]))
         assert sched._compact_resolved
-        # Gate is resolved (to legacy) so stores are no longer blocked
         assert sched._compact_requested
         assert sched._compact_resolved
 
-    def test_enable_compact_called_on_pass(self):
-        """On consensus pass, manager.enable_compact is called."""
-        from unittest.mock import MagicMock
+    # --- Recording manager ---
 
+    def test_recording_manager_resolved_after_success(self):
+        """Recording manager: _compact_resolved set only after enable_compact
+        succeeds, and arguments forwarded correctly."""
         sched = _make_scheduler(world_size=2)
-        # Replace manager with mock to track enable_compact calls
-        mock_mgr = MagicMock()
-        sched.manager = mock_mgr
+        recorder = _RecordingManager()
+        sched.manager = recorder
 
         ev0 = _make_evidence(rank=0, canonical_bytes=(64,))
         ev1 = _make_evidence(rank=1, canonical_bytes=(64,), is_writer=False)
         sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        assert not sched._compact_resolved
+
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
-        mock_mgr.enable_compact.assert_called_once()
-        assert mock_mgr.enable_compact.call_args.kwargs["preferred_groups"] == (
+        assert recorder.enable_compact_called
+        assert recorder.enable_compact_kwargs is not None
+        assert recorder.enable_compact_kwargs["preferred_groups"] == (
             1,
             2,
             3,
             4,
         )
 
+    # === Decisive rejection cases ===
+
+    def test_non_invariant_reject(self):
+        """parallel_invariant=False — immediate legacy."""
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        ev = _make_evidence(rank=0, parallel_invariant=False)
+        sched._process_compact_geometry_report(_meta([(0, ev)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
+
+    def test_stride_mismatch_fails(self):
+        """Same canonical byte totals but differing gpu_row_stride — different
+        signatures — must NOT activate compact."""
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        run = MappedRun(0, 0, 64, 1, 64, 64)
+        mapping = CanonicalPageMapping(64, 64, (run,), (run,), True)
+        layer = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping,
+            local_page_size_bytes=64,
+            canonical_page_size_bytes=64,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        geom0 = CompactGroupGeometry(
+            layers=(layer,),
+            gpu_row_stride=128,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+        geom1 = CompactGroupGeometry(
+            layers=(layer,),
+            gpu_row_stride=256,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+
+        ev0 = CompactRankEvidence.from_geometry(
+            rank=0,
+            world_size=2,
+            geometry=(geom0,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+        ev1 = CompactRankEvidence.from_geometry(
+            rank=1,
+            world_size=2,
+            geometry=(geom1,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+
+        sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        assert not sched._compact_resolved
+        sched._process_compact_geometry_report(_meta([(1, ev1)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
+
+    def test_load_run_mismatch_fails(self):
+        """Same canonical bytes but differing load-run fragment sizes — must
+        NOT activate compact."""
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        mapping0 = CanonicalPageMapping(
+            64,
+            64,
+            store_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
+            load_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
+            parallel_invariant=True,
+        )
+        mapping1 = CanonicalPageMapping(
+            64,
+            64,
+            store_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
+            load_runs=(
+                MappedRun(0, 0, 32, 1, 64, 64),
+                MappedRun(32, 32, 32, 1, 64, 64),
+            ),
+            parallel_invariant=True,
+        )
+        layer0 = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping0,
+            local_page_size_bytes=64,
+            canonical_page_size_bytes=64,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        layer1 = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping1,
+            local_page_size_bytes=64,
+            canonical_page_size_bytes=64,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        geom0 = CompactGroupGeometry(
+            layers=(layer0,),
+            gpu_row_stride=128,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+        geom1 = CompactGroupGeometry(
+            layers=(layer1,),
+            gpu_row_stride=128,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+
+        ev0 = CompactRankEvidence.from_geometry(
+            rank=0,
+            world_size=2,
+            geometry=(geom0,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+        ev1 = CompactRankEvidence.from_geometry(
+            rank=1,
+            world_size=2,
+            geometry=(geom1,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+
+        sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        assert not sched._compact_resolved
+        sched._process_compact_geometry_report(_meta([(1, ev1)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
+
+    def test_invalid_writer_role_fails(self):
+        """Writer with store != load has role_mapping_valid=False — fail."""
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        load_run = MappedRun(0, 0, 64, 1, 64, 64)
+        store_run = MappedRun(0, 0, 32, 1, 64, 64)  # partial
+        mapping = CanonicalPageMapping(
+            64,
+            64,
+            store_runs=(store_run,),
+            load_runs=(load_run,),
+            parallel_invariant=True,
+        )
+        layer = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping,
+            local_page_size_bytes=64,
+            canonical_page_size_bytes=64,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        geom = CompactGroupGeometry(
+            layers=(layer,),
+            gpu_row_stride=128,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+
+        ev = CompactRankEvidence.from_geometry(
+            rank=0,
+            world_size=2,
+            geometry=(geom,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+        assert ev.is_writer
+        assert not ev.role_mapping_valid
+
+        sched._process_compact_geometry_report(_meta([(0, ev)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
+
+    def test_valid_writer_nonwriter_activates(self):
+        """Valid writer (store==load) and nonwriter (empty stores) with
+        identical role-neutral signatures — must activate compact."""
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        load_run = MappedRun(0, 0, 64, 1, 64, 64)
+        mapping_writer = CanonicalPageMapping(
+            64,
+            64,
+            store_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
+            load_runs=(load_run,),
+            parallel_invariant=True,
+        )
+        mapping_nonwriter = CanonicalPageMapping(
+            64,
+            64,
+            store_runs=(),
+            load_runs=(load_run,),
+            parallel_invariant=True,
+        )
+        layer_w = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping_writer,
+            local_page_size_bytes=64,
+            canonical_page_size_bytes=64,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        layer_nw = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping_nonwriter,
+            local_page_size_bytes=64,
+            canonical_page_size_bytes=64,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        geom_w = CompactGroupGeometry(
+            layers=(layer_w,),
+            gpu_row_stride=128,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+        geom_nw = CompactGroupGeometry(
+            layers=(layer_nw,),
+            gpu_row_stride=128,
+            local_extent=64,
+            canonical_extent=64,
+            parallel_invariant=True,
+        )
+
+        ev0 = CompactRankEvidence.from_geometry(
+            rank=0,
+            world_size=2,
+            geometry=(geom_w,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+        ev1 = CompactRankEvidence.from_geometry(
+            rank=1,
+            world_size=2,
+            geometry=(geom_nw,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
+
+        assert ev0.is_writer
+        assert ev0.role_mapping_valid
+        assert not ev1.is_writer
+        assert ev1.role_mapping_valid
+        assert ev0.signature == ev1.signature
+
+        sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        assert not sched._compact_resolved
+        sched._process_compact_geometry_report(_meta([(1, ev1)]))
+        assert sched._compact_resolved
+        assert recorder.enable_compact_called
+
+    def test_unsupported_schema_fails(self):
+        """Schema version != 2 — immediate legacy fallback."""
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        ev = _make_evidence(rank=0)
+        # Override schema_version in the raw evidence.
+        bad = CompactRankEvidence(
+            rank=0,
+            world_size=2,
+            group_available=(True,),
+            canonical_bytes=(64,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+            expected_world_size=2,
+            schema_version=1,
+            signature=ev.signature,
+            role_mapping_valid=True,
+        )
+        sched._process_compact_geometry_report(_meta([(0, bad)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
+
 
 # ===================================================================
-# update_connector_output integration: all-rank batch boundary
+# Real aggregated worker-output boundary
 # ===================================================================
 
 
 class TestCompactConsensusUpdateConnectorOutput:
-    """Consensus through update_connector_output at the aggregated batch
-    boundary.  The first nonempty batch is the sole opportunity: complete
-    sets activate, partial sets immediately fail, empty batches leave
-    state unchanged."""
+    """Exercise the sole production consensus opportunity."""
+
+    @staticmethod
+    def _output(reports):
+        from vllm.v1.outputs import KVConnectorOutput
+
+        return KVConnectorOutput(kv_connector_worker_meta=_meta(reports))
 
     def test_complete_two_rank_batch_activates(self):
-        """A single aggregated batch with both ranks activates compact."""
-        from unittest.mock import MagicMock
-
-        from vllm.v1.outputs import KVConnectorOutput
-
         sched = _make_scheduler(world_size=2)
-        mock_mgr = MagicMock()
-        sched.manager = mock_mgr
+        recorder = _RecordingManager()
+        sched.manager = recorder
+        ev0 = _make_evidence(rank=0)
+        ev1 = _make_evidence(rank=1, is_writer=False)
 
-        ev0 = _make_evidence(rank=0, canonical_bytes=(64,))
-        ev1 = _make_evidence(rank=1, canonical_bytes=(64,), is_writer=False)
-        meta = _meta([(0, ev0), (1, ev1)])
-        output = KVConnectorOutput(kv_connector_worker_meta=meta)
+        sched.update_connector_output(self._output([(0, ev0), (1, ev1)]))
 
-        sched.update_connector_output(output)
         assert sched._compact_resolved
-        mock_mgr.enable_compact.assert_called_once()
+        assert recorder.enable_compact_called
 
     def test_partial_batch_immediately_fails_legacy(self):
-        """Single batch with only some ranks immediately resolves to
-        legacy — no second cycle."""
-        from unittest.mock import MagicMock
-
-        from vllm.v1.outputs import KVConnectorOutput
-
         sched = _make_scheduler(world_size=2)
-        mock_mgr = MagicMock()
-        sched.manager = mock_mgr
+        recorder = _RecordingManager()
+        sched.manager = recorder
 
-        ev0 = _make_evidence(rank=0, canonical_bytes=(64,))
-        meta = _meta([(0, ev0)])
-        output = KVConnectorOutput(kv_connector_worker_meta=meta)
+        sched.update_connector_output(self._output([(0, _make_evidence(rank=0))]))
 
-        sched.update_connector_output(output)
-        assert sched._compact_resolved  # resolved to legacy
-        mock_mgr.enable_compact.assert_not_called()
+        assert sched._compact_resolved
+        assert sched._compact_report_rank_mask == 1
+        assert not recorder.enable_compact_called
 
     def test_no_report_batch_stays_unresolved(self):
-        """Empty compact_reports before any evidence leaves state
-        unresolved — engine has not yet presented registration
-        opportunity."""
-        from vllm.v1.outputs import KVConnectorOutput
-
         sched = _make_scheduler(world_size=2)
 
-        meta = _meta([])
-        output = KVConnectorOutput(kv_connector_worker_meta=meta)
+        sched.update_connector_output(self._output([]))
 
-        sched.update_connector_output(output)
         assert not sched._compact_resolved
         assert sched._compact_report_rank_mask == 0
 
+    @pytest.mark.parametrize(
+        ("manager", "error"),
+        [
+            (_UnsupportedManager(), NotImplementedError),
+            (_RaisingManager(), RuntimeError),
+        ],
+    )
+    def test_activation_failure_propagates_and_keeps_gate_closed(self, manager, error):
+        sched = _make_scheduler(world_size=2)
+        sched.manager = manager
+        ev0 = _make_evidence(rank=0)
+        ev1 = _make_evidence(rank=1, is_writer=False)
 
-# ===================================================================
-# Spec compact layout request tests
-# ===================================================================
+        with pytest.raises(error):
+            sched.update_connector_output(self._output([(0, ev0), (1, ev1)]))
 
-
-class TestCompactSpecRequest:
-    def test_default_compact_layout_false(self):
-        """Default enable_compact_layout=False means no report/gating."""
-        from vllm.v1.kv_offload.config import OffloadingConfig
-
-        config = MagicMock(spec=OffloadingConfig)
-        config.extra_config = {"cpu_bytes_to_use": 10**9}
-        config.parallel = MagicMock()
-        config.parallel.world_size = 1
-        config.worker_kv_bytes_per_block = 1024
-        config.cache = MagicMock()
-        config.cache.blocks_per_chunk = 1
-        config.cache.tokens_per_block = 16
-        config.cache.tokens_per_hash = 16
-        config.groups = []
-        config.replicated_layout = False
-        config.enable_kv_cache_events = False
-
-        spec = CPUOffloadingSpec(config)
-        assert not spec.compact_layout_requested
-
-    def test_enable_compact_layout_true(self):
-        """enable_compact_layout=True propagates through spec."""
-        from vllm.v1.kv_offload.config import OffloadingConfig
-        from vllm.v1.kv_offload.cpu.spec import _parse_enable_compact_layout
-
-        config = MagicMock(spec=OffloadingConfig)
-        config.extra_config = {
-            "cpu_bytes_to_use": 10**9,
-            "enable_compact_layout": True,
-        }
-        config.parallel = MagicMock()
-        config.parallel.world_size = 1
-        config.worker_kv_bytes_per_block = 1024
-        config.cache = MagicMock()
-        config.cache.blocks_per_chunk = 1
-        config.cache.tokens_per_block = 16
-        config.cache.tokens_per_hash = 16
-        config.groups = []
-        config.replicated_layout = False
-        config.enable_kv_cache_events = False
-
-        spec = CPUOffloadingSpec(config)
-        assert spec.compact_layout_requested
-
-        # Strict validator
-        assert _parse_enable_compact_layout("true") is True
-        assert _parse_enable_compact_layout("false") is False
-        assert _parse_enable_compact_layout(True) is True
-        assert _parse_enable_compact_layout(False) is False
-        assert _parse_enable_compact_layout("True") is True
-        assert _parse_enable_compact_layout("FALSE") is False
-
-        # Reject invalid
-        with pytest.raises(ValueError):
-            _parse_enable_compact_layout("yes")
-        with pytest.raises(ValueError):
-            _parse_enable_compact_layout(1)
-        with pytest.raises(ValueError):
-            _parse_enable_compact_layout(0)
-
-    def test_no_compact_manager_state_constructed(self):
-        """Spec does NOT construct special manager state."""
-        from vllm.v1.kv_offload.config import OffloadingConfig
-
-        config = MagicMock(spec=OffloadingConfig)
-        config.extra_config = {
-            "cpu_bytes_to_use": 10**9,
-            "enable_compact_layout": True,
-        }
-        config.parallel = MagicMock()
-        config.parallel.world_size = 1
-        config.worker_kv_bytes_per_block = 1024
-        config.cache = MagicMock()
-        config.cache.blocks_per_chunk = 1
-        config.cache.tokens_per_block = 16
-        config.cache.tokens_per_hash = 16
-        config.groups = []
-        config.replicated_layout = False
-        config.enable_kv_cache_events = False
-
-        spec = CPUOffloadingSpec(config)
-        assert spec.compact_layout_requested
-        # Manager is lazily constructed and unmodified by compact_requested
-        mgr = spec.get_manager()
-        assert mgr is not None
-        # Compact state exists but remains disabled until rank consensus.
-        assert not mgr._compact_enabled
-        assert mgr._compact_allocator is None
+        assert not sched._compact_resolved
+        assert sched._compact_report_rank_mask == 0b11
 
 
-# ===================================================================
-# Base manager enable_compact fail-closed test
-# ===================================================================
-
-
-class TestManagerEnableCompact:
-    def test_enable_compact_requires_group_sizes(self):
+class TestConcreteManagerEnableCompact:
+    def test_missing_group_sizes_fails_without_activation(self):
         from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-        mgr = CPUOffloadingManager(num_blocks=100)
+        manager = CPUOffloadingManager(num_blocks=100)
         with pytest.raises(RuntimeError, match="activation failed"):
-            mgr.enable_compact(total_bytes=6553600, page_size=65536)
-        assert not mgr._compact_enabled
-
-    def test_enable_compact_activates_concrete_manager(self):
-        from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
-
-        mgr = CPUOffloadingManager(num_blocks=100)
-        mgr.enable_compact(
-            total_bytes=6553600,
-            page_size=65536,
-            key_sizes={0: 4096},
-        )
-        assert mgr._compact_enabled
-        assert mgr._compact_allocator is not None
+            manager.enable_compact(total_bytes=6553600, page_size=65536)
+        assert not manager._compact_enabled
+        assert manager._compact_allocator is None

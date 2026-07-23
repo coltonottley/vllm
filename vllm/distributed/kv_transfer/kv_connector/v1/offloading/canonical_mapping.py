@@ -300,6 +300,8 @@ def _layer_mapping(
         # Rotating-writer election spreads store traffic across ranks.
         if ctx.cp_size != 1 or spec.num_kv_heads != 1:
             return None
+        if spec.kv_quant_mode.is_per_token_head:
+            return None
         if ctx.total_kv_heads != 1:
             return None
         if not isinstance(kv_cache, torch.Tensor):

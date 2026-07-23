@@ -120,45 +120,70 @@ class ARCCachePolicy(CachePolicy):
         protected: set[OffloadKey],
         prefer_evict: "Callable[[OffloadKey], bool] | None" = None,
     ) -> list[tuple[OffloadKey, BlockStatus]] | None:
-        """Non-mutating oldest-first candidate selection.
+        """Non-mutating eviction candidate selection in exact ARC order.
 
-        Walks T1 then T2 (or T2 when target_t1_size is exceeded) in
-        insertion order. Within each partition, preferred candidates
-        are offered before normal ones. Preferred keys NEVER appear
-        again in the normal pass. Returns candidates if
-        can_fit returns True; does NOT mutate policy state.
+        Selects one candidate at a time according to current virtual T1 size
+        vs target: if virtual_t1_size >= target, select from T1 (preferred
+        first, then normal) and decrement virtual_t1; otherwise select from
+        T2.  After each candidate ``can_fit`` is called; if it returns True
+        the collected prefix is returned.  On exhaustion returns None with
+        zero mutation.
+
+        Protected keys and entries with non-zero ``ref_cnt`` are never
+        selected.  Preferred keys are offered before normal ones within each
+        partition and never appear again in the same partition's normal pass.
         """
         candidates: list[tuple[OffloadKey, BlockStatus]] = []
         already_selected: set[OffloadKey] = set()
+        virtual_t1_size: int = len(self.t1)
 
-        def _walk(
-            source: OrderedDict[OffloadKey, BlockStatus],
-            pred: "Callable[[OffloadKey], bool] | None",
-        ) -> bool:
-            for key, block in source.items():
-                if block.ref_cnt != 0 or key in protected:
-                    continue
-                if pred is not None and not pred(key):
-                    continue
-                if key in already_selected:
-                    continue
-                candidates.append((key, block))
-                already_selected.add(key)
-                if can_fit(candidates):
-                    return True
-            return False
+        while True:
+            candidate: tuple[OffloadKey, BlockStatus] | None = None
 
-        # Walk T1 first (or T2 when target exceeded), with preferred pass.
-        if len(self.t1) >= int(self.target_t1_size):
-            if prefer_evict is not None and _walk(self.t1, prefer_evict):
+            if virtual_t1_size >= int(self.target_t1_size):
+                # Preferred pass first, then normal pass.
+                for preferred_only in (True, False):
+                    for key, block in self.t1.items():
+                        if (
+                            block.ref_cnt == 0
+                            and key not in protected
+                            and key not in already_selected
+                            and (
+                                not preferred_only
+                                or (prefer_evict is not None and prefer_evict(key))
+                            )
+                        ):
+                            candidate = (key, block)
+                            virtual_t1_size -= 1
+                            break
+                    if candidate is not None:
+                        break
+
+            if candidate is None:
+                for preferred_only in (True, False):
+                    for key, block in self.t2.items():
+                        if (
+                            block.ref_cnt == 0
+                            and key not in protected
+                            and key not in already_selected
+                            and (
+                                not preferred_only
+                                or (prefer_evict is not None and prefer_evict(key))
+                            )
+                        ):
+                            candidate = (key, block)
+                            break
+                    if candidate is not None:
+                        break
+
+            if candidate is None:
+                return None
+
+            candidates.append(candidate)
+            already_selected.add(candidate[0])
+
+            if can_fit(candidates):
                 return candidates
-            if _walk(self.t1, None):
-                return candidates
-        if prefer_evict is not None and _walk(self.t2, prefer_evict):
-            return candidates
-        if _walk(self.t2, None):
-            return candidates
-        return None
 
     @override
     def evict(
