@@ -305,10 +305,7 @@ def plan_compact_transfer(
                 )
             ):
                 # Select runs based on direction
-                if direction == "store":
-                    runs = mapping.store_runs
-                else:
-                    runs = mapping.load_runs
+                runs = mapping.store_runs if direction == "store" else mapping.load_runs
 
                 if not runs:
                     # Non-writer store mapping -> zero descriptors
