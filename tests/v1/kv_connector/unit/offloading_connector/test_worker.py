@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 import pytest
 import torch
@@ -680,9 +680,21 @@ def test_register_kv_caches_uniform_type(backend):
 # Compact geometry tests
 
 
+class _GeometryRecordingHandler:
+    def __init__(self):
+        self.geometry = None
+
+    def configure_compact_geometry(self, groups):
+        if self.geometry is not None:
+            raise RuntimeError("one-shot")
+        self.geometry = groups
+
+
 class CompactRecordingWorker(CPUOffloadingWorker):
     def __init__(self):
         self._compact_geometry = None
+        self._store_handler = _GeometryRecordingHandler()
+        self._load_handler = _GeometryRecordingHandler()
         self.configure_calls: list[tuple[CompactGroupGeometry | None, ...]] = []
 
     def configure_compact_geometry(self, groups):
@@ -907,6 +919,15 @@ def test_register_kv_caches_compact_geometry():
     sm.replicated_layout = False
     sm.config = MagicMock()
     sm.config.parallel.rank = 0
+    sm.config.parallel.world_size = 2
+    sm.config.worker_kv_bytes_per_block = 1024
+    sm.blocks_per_chunk = 1
+    sm.extra_config = {"cpu_bytes_to_use": 10**9}
+    sm.get_worker.return_value = rec
+    # Enable compact layout so worker derives rank evidence and geometry.
+    type(sm).compact_layout_requested = PropertyMock(return_value=True)
+    type(sm).compact_page_size = PropertyMock(return_value=65536)
+    type(sm).compact_storage_budget_bytes = PropertyMock(return_value=10**9)
     sm.get_worker.return_value = rec
     w = OffloadingConnectorWorker(
         spec=sm, vllm_config=_mock_vllm_config(), kv_cache_config=kcc
@@ -936,6 +957,9 @@ def test_register_kv_caches_plugin_no_geometry():
     spec.replicated_layout = False
     spec.config = MagicMock()
     spec.config.parallel.rank = 0
+    # Ensure compact_layout_requested is False so compact geometry is
+    # not derived for non-packed groups.
+    type(spec).compact_layout_requested = PropertyMock(return_value=False)
     spec.get_worker.return_value = MagicMock(spec=OffloadingWorker)
     attn = FullAttentionSpec(
         block_size=BLOCK_SIZE,
