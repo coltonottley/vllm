@@ -51,6 +51,7 @@ def swap_blocks_batch(
     dst_addrs: torch.Tensor,
     sizes: torch.Tensor,
     is_src_access_order_any: bool = False,
+    use_batch_api: bool = True,
     *,
     bytes_per_chunk: int,
 ) -> None:
@@ -63,6 +64,7 @@ def swap_blocks_batch(
             dst_addrs,
             sizes,
             is_src_access_order_any=is_src_access_order_any,
+            use_batch_api=use_batch_api,
         )
         return
     _swap_blocks_kernel[(min(NUM_SMS, n),)](

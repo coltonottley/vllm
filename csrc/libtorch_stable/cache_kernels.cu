@@ -79,7 +79,8 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
 void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& dst_ptrs,
                        const torch::stable::Tensor& sizes,
-                       bool is_src_access_order_any) {
+                       bool is_src_access_order_any,
+                       bool use_batch_api) {
   STD_TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
   STD_TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
   STD_TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
@@ -101,6 +102,19 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
   int64_t* size_data = sizes.mutable_data_ptr<int64_t>();
 
   const cudaStream_t stream = get_current_cuda_stream();
+
+  // When use_batch_api is false, skip the batch API entirely and go
+  // straight to per-descriptor cudaMemcpyAsync.  This avoids driver
+  // batch-API segfaults at very large descriptor counts (e.g. 20K+).
+  if (!use_batch_api) {
+    for (int64_t i = 0; i < n; i++) {
+      cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
+                      reinterpret_cast<void*>(src_data[i]),
+                      static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
+                      stream);
+    }
+    return;
+  }
 
   // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
   // single driver call, amortizing per-copy submission overhead. int64_t
