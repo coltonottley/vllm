@@ -610,3 +610,103 @@ def test_wait_for_file_size_timeout(tmp_path):
             _wait_for_file_size(fd, PAGE_SIZE, timeout=0.1)
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Read-only accessors (base_tensor, base_ptr)
+# ---------------------------------------------------------------------------
+
+
+def test_base_tensor_accessor_returns_same_as_base(iid):
+    """base_tensor property must return the identical tensor object as _base."""
+    with _region(iid) as r:
+        assert r.base_tensor is r._base
+        assert r.base_tensor is not None
+
+
+def test_base_tensor_is_none_after_cleanup(iid):
+    """base_tensor must be None after cleanup()."""
+    r = _make_region(iid)
+    r.cleanup()
+    _cleanup_file(r.mmap_path)
+    assert r.base_tensor is None
+
+
+def test_base_ptr_matches_base_data_ptr(iid):
+    """base_ptr must equal _base.data_ptr() when the region is active."""
+    with _region(iid) as r:
+        assert r.base_ptr == r._base.data_ptr()
+        assert r.base_ptr != 0
+
+
+def test_base_ptr_is_zero_after_cleanup(iid):
+    """base_ptr must be 0 after cleanup()."""
+    r = _make_region(iid)
+    r.cleanup()
+    _cleanup_file(r.mmap_path)
+    assert r.base_ptr == 0
+
+
+def test_base_tensor_and_views_coexist_over_one_mmap(iid):
+    """create_next_view views still work after reading base_tensor; both
+    share the same underlying storage."""
+    with _region(iid, num_blocks=4) as r:
+        bt = r.base_tensor
+        assert bt is not None
+
+        v = r.create_next_view(PAGE_SIZE)
+        v[:, :] = 99
+
+        # write visible through base_tensor at the correct raw offset
+        row_stride = 1 * PAGE_SIZE  # num_workers=1 -> row_stride = cpu_page_size
+        blk2_offset = 2 * row_stride
+        raw_slice = bytes(bt[blk2_offset : blk2_offset + PAGE_SIZE].numpy())
+        assert all(b == 99 for b in raw_slice), (
+            "views and base_tensor must share the same mmap storage"
+        )
+
+        del bt, v  # release before cleanup
+
+
+def test_base_ptr_and_views_point_to_same_storage(iid):
+    """base_ptr arithmetic must produce the same addresses as view data_ptr."""
+    with _region(iid, num_blocks=2, cpu_page_size=2 * PAGE_SIZE) as r:
+        t0 = r.create_next_view(PAGE_SIZE)
+        t1 = r.create_next_view(PAGE_SIZE)
+        base = r.base_ptr
+
+        # view t0 starts at _worker_offset before first call = 0
+        assert t0.data_ptr() == base
+
+        # view t1 starts at PAGE_SIZE (advanced by first allocation)
+        assert t1.data_ptr() == base + PAGE_SIZE
+
+        # Block-row stride: pointer(t0, block b) = base + b * row_stride
+        row_stride = r._row_stride
+        ptr_block1 = t0[1].data_ptr()
+        expected_block1 = base + 1 * row_stride
+        assert ptr_block1 == expected_block1, (
+            f"Block 1 view pointer {ptr_block1} != "
+            f"expected {expected_block1} (base={base}, stride={row_stride})"
+        )
+
+        del t0, t1
+
+
+def test_base_ptr_full_region_range(iid):
+    """base_ptr through base_ptr + total_size_bytes covers every byte of
+    every view slot."""
+    with _region(iid, num_blocks=3, cpu_page_size=2 * PAGE_SIZE) as r:
+        t0 = r.create_next_view(PAGE_SIZE)
+        t1 = r.create_next_view(PAGE_SIZE)
+        base = r.base_ptr
+        total = r.total_size_bytes
+
+        # The last accessible byte in view t1 at block 2
+        last_block = 2
+        ptr_last = t1[last_block].data_ptr() + (PAGE_SIZE - 1)
+        assert base <= ptr_last < base + total, (
+            f"Last accessible byte ptr {ptr_last} must be in [{base}, {base + total})"
+        )
+
+        del t0, t1

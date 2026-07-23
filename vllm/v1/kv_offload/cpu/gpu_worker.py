@@ -528,6 +528,10 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=False,
         )
 
+        # Retain the base region reference for future compact descriptor planning.
+        # The compact planner needs the full base, not handler-private traversal.
+        self._mmap_region: SharedOffloadRegion | None = mmap_region
+
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
@@ -550,3 +554,4 @@ class CPUOffloadingWorker(OffloadingWorker):
     def shutdown(self) -> None:
         self._store_handler.shutdown()
         self._load_handler.shutdown()
+        self._mmap_region = None

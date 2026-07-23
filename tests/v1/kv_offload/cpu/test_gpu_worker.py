@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import mmap
 import random
 import time
 import uuid
@@ -21,6 +22,8 @@ from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+PAGE_SIZE = mmap.PAGESIZE
 
 NUM_GPU_BLOCKS = [64]
 NUM_CPU_BLOCKS = [256]
@@ -440,4 +443,136 @@ def test_transfer_multi_group(
                     dst_view[dst_sub_block].cpu(), expected.cpu()
                 )
 
+    worker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Worker reference retention (foundation for future compact descriptor)
+# ---------------------------------------------------------------------------
+
+
+def _make_kv_caches(
+    num_tensors: int = 2,
+    num_gpu_blocks: int = 64,
+    gpu_page_size_bytes: int = 512,
+) -> CanonicalKVCaches:
+    _device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    kv_cache_tensors: list[CanonicalKVCacheTensor] = []
+    for _ in range(num_tensors):
+        gpu_tensor = torch.zeros(
+            (num_gpu_blocks, gpu_page_size_bytes),
+            dtype=torch.int8,
+            device=_device,
+        )
+        kv_cache_tensors.append(
+            CanonicalKVCacheTensor(
+                tensor=gpu_tensor,
+                page_size_bytes=gpu_page_size_bytes,
+            )
+        )
+    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]] = [
+        [
+            CanonicalKVCacheRef(
+                tensor_idx=i,
+                page_size_bytes=gpu_page_size_bytes,
+            )
+            for i in range(num_tensors)
+        ]
+    ]
+    return CanonicalKVCaches(
+        tensors=kv_cache_tensors,
+        group_data_refs=kv_cache_groups_data_refs,
+    )
+
+
+@torch.inference_mode()
+def test_worker_retains_mmap_region_reference():
+    """CPUOffloadingWorker must retain the mmap_region as _mmap_region."""
+    kv_caches = _make_kv_caches()
+    mmap_region = SharedOffloadRegion(
+        engine_id=str(uuid.uuid4()),
+        num_blocks=64,
+        rank=0,
+        kv_bytes_per_block=2 * PAGE_SIZE,
+        cpu_page_size=2 * PAGE_SIZE,
+    )
+    try:
+        worker = CPUOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=1,
+            num_cpu_blocks=64,
+            mmap_region=mmap_region,
+        )
+        assert worker._mmap_region is mmap_region
+        worker.shutdown()
+        # After shutdown the worker-level ref must be None, and the region
+        # itself must be cleaned up (base_ptr 0, base_tensor None) by the
+        # store handler *before* the worker ref is cleared.
+        assert worker._mmap_region is None, (
+            "worker._mmap_region must be None after shutdown"
+        )
+        assert mmap_region.base_ptr == 0, (
+            "mmap base_ptr must be 0 after shutdown (store handler cleaned up)"
+        )
+        assert mmap_region.base_tensor is None, (
+            "mmap base_tensor must be None after shutdown"
+        )
+    finally:
+        mmap_region.cleanup()
+
+
+@torch.inference_mode()
+def test_worker_without_mmap_region():
+    """Without mmap_region, _mmap_region must be None."""
+    kv_caches = _make_kv_caches()
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches,
+        blocks_per_chunk=1,
+        num_cpu_blocks=64,
+    )
+    assert worker._mmap_region is None
+    worker.shutdown()
+
+
+@torch.inference_mode()
+def test_worker_mmap_region_reference_passed_to_store_handler():
+    """The mmap_region reference must be forwarded to the store handler."""
+    kv_caches = _make_kv_caches()
+    mmap_region = SharedOffloadRegion(
+        engine_id=str(uuid.uuid4()),
+        num_blocks=64,
+        rank=0,
+        kv_bytes_per_block=2 * PAGE_SIZE,
+        cpu_page_size=2 * PAGE_SIZE,
+    )
+    try:
+        worker = CPUOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=1,
+            num_cpu_blocks=64,
+            mmap_region=mmap_region,
+        )
+        # The store handler owns cleanup of mmap_region via shutdown()
+        assert worker._store_handler._mmap_region is mmap_region
+        worker.shutdown()
+    finally:
+        # mmap region is cleaned up by store_handler.shutdown()
+        pass
+
+
+@torch.inference_mode()
+def test_worker_fallback_pinned_tensors():
+    """Without mmap_region, CPU tensors are allocated as pinned torch.zeros
+    (no mmap registration, no extra references besides pinning)."""
+    kv_caches = _make_kv_caches()
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches,
+        blocks_per_chunk=1,
+        num_cpu_blocks=64,
+    )
+    # Verify no mmap region reference is held
+    assert worker._mmap_region is None
+    # cpu_tensors are pinned via torch.zeros(pin_memory=True) when no mmap
+    for cpu_t in worker._store_handler.dst_tensors:
+        assert cpu_t.is_pinned()
     worker.shutdown()
