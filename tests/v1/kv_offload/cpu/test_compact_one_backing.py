@@ -20,6 +20,7 @@ import uuid
 import pytest
 import torch
 
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -234,6 +235,122 @@ class TestOneConstruction:
         )
         assert manager._compact_allocator is not None
         assert manager._compact_allocator.page_size == spec.compact_page_size
+
+    def test_compact_non_page_aligned_tp2_geometry(self, monkeypatch):
+        """Compact TP2 aligns only the shared row and shares one row count."""
+        engine_id = f"test-{uuid.uuid4().hex[:8]}"
+        budget = 65536
+        config = _make_minimal_config(
+            extra_config={
+                "cpu_bytes_to_use": str(budget),
+                "enable_compact_layout": "true",
+            },
+            world_size=2,
+            rank=0,
+            engine_id=engine_id,
+            worker_kv_bytes=500,
+        )
+        spec = CPUOffloadingSpec(config)
+
+        raw_row = spec.cpu_page_size_per_worker * config.parallel.world_size
+        assert spec.BLOCK_SIZE_ALIGNMENT == 1
+        assert raw_row == 1000
+        assert raw_row % PAGE_SIZE
+        assert spec._compact_row_stride == PAGE_SIZE
+        assert spec._compact_num_rows == budget // PAGE_SIZE == 16
+        assert spec.num_blocks == budget // raw_row == 65
+
+        pre_region_budget = spec.compact_storage_budget_bytes
+        region0 = spec._build_compact_shared_region()
+        region1 = None
+        try:
+            assert region0._row_stride == PAGE_SIZE
+            assert region0.num_blocks == spec._compact_num_rows
+            assert region0.total_size_bytes == pre_region_budget == budget
+
+            config1 = _make_minimal_config(
+                extra_config={
+                    "cpu_bytes_to_use": str(budget),
+                    "enable_compact_layout": "true",
+                },
+                world_size=2,
+                rank=1,
+                engine_id=engine_id,
+                worker_kv_bytes=500,
+            )
+            spec1 = CPUOffloadingSpec(config1)
+            region1 = spec1._build_compact_shared_region()
+            view0 = region0.create_next_view(spec.cpu_page_size_per_worker)
+            view1 = region1.create_next_view(spec1.cpu_page_size_per_worker)
+            assert view0.shape == view1.shape == (spec._compact_num_rows, 500)
+            assert view0.stride(0) == view1.stride(0) == PAGE_SIZE
+            assert view0.storage_offset() == 0
+            assert view1.storage_offset() == 500
+
+            spec._worker_shared_region = region0
+            assert spec.compact_storage_budget_bytes == pre_region_budget
+            assert spec.get_manager()._num_blocks == spec._compact_num_rows
+
+            captured = {}
+
+            def fake_worker(**kwargs):
+                captured.update(kwargs)
+                return object()
+
+            monkeypatch.setattr(
+                "vllm.v1.kv_offload.cpu.spec.CPUOffloadingWorker", fake_worker
+            )
+            sentinel_caches = object()
+            result = spec.create_worker(sentinel_caches, mmap_region=region0)
+            assert result is not None
+            assert captured["kv_caches"] is sentinel_caches
+            assert captured["num_cpu_blocks"] == region0.num_blocks
+            assert captured["mmap_region"] is region0
+        finally:
+            spec._worker_shared_region = None
+            if region1 is not None:
+                region1.cleanup()
+            region0.cleanup()
+            _cleanup_file(region0.mmap_path)
+
+        assert not os.path.exists(region0.mmap_path)
+
+    def test_preferred_group_derivation_uses_ordered_real_groups(self):
+        config = _make_minimal_config(
+            extra_config={
+                "cpu_bytes_to_use": str(16 * 1024 * 1024),
+                "enable_compact_layout": "true",
+            }
+        )
+        spec = CPUOffloadingSpec(config)
+        groups = [
+            KVCacheGroupSpec(
+                layer_names=["ordinary"], kv_cache_spec=object(), is_eagle_group=False
+            ),
+            KVCacheGroupSpec(
+                layer_names=["eagle"], kv_cache_spec=object(), is_eagle_group=True
+            ),
+        ]
+        spec.maybe_derive_compact_preferred_eviction_groups(
+            KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=groups)
+        )
+        assert spec.compact_preferred_eviction_groups == (1,)
+
+    def test_compact_budget_must_fit_aligned_shared_row(self):
+        config = _make_minimal_config(
+            extra_config={
+                "cpu_bytes_to_use": str(2048),
+                "enable_compact_layout": "true",
+                "compact_page_size": "1024",
+            },
+            world_size=2,
+            worker_kv_bytes=1500,
+        )
+        spec = CPUOffloadingSpec(config)
+        assert spec._compact_row_stride == PAGE_SIZE
+        assert spec._compact_num_rows == 0
+        with pytest.raises(RuntimeError, match="cannot fit one shared row"):
+            spec._build_compact_shared_region()
 
 
 # ===========================================================================
