@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
@@ -224,21 +225,72 @@ def _layer_mapping(
         return None
 
     if isinstance(spec, MLAAttentionSpec):
-        # TP-replicated latent; CP shards its tokens; first DCP group writes
-        if (
-            spec.compress_ratio != 1
-            or page % bs
-            or spec.kv_quant_mode.is_per_token_head
-        ):
+        if spec.compress_ratio == 1:
+            # TP-replicated latent; CP shards its tokens; first DCP group writes
+            if page % bs or spec.kv_quant_mode.is_per_token_head:
+                return None
+            row = page // bs
+            runs = _chunk_runs([(0, 0, row, row)], bs, ctx)
+            return CanonicalPageMapping(
+                canonical_page_size_bytes=ctx.cp_size * page,
+                local_page_size_bytes=page,
+                store_runs=runs if ctx.tp_rank < ctx.dcp_size else (),
+                load_runs=runs,
+                parallel_invariant=ctx.cp_size == 1,
+            )
+
+        # Compressed MLA: TP-replicated latent with compress_ratio > 1.
+        # rank 0 writes one whole-page canonical copy; other TP ranks
+        # read only (identical latent).  No CP (cp_size == 1) because
+        # compressed slots are not 1:1 with tokens.
+        if ctx.cp_size != 1:
             return None
-        row = page // bs
-        runs = _chunk_runs([(0, 0, row, row)], bs, ctx)
+        if spec.kv_quant_mode.is_per_token_head or page <= 0:
+            return None
+        run = MappedRun(0, 0, page, 1, page, page)
         return CanonicalPageMapping(
-            canonical_page_size_bytes=ctx.cp_size * page,
+            canonical_page_size_bytes=page,
             local_page_size_bytes=page,
-            store_runs=runs if ctx.tp_rank < ctx.dcp_size else (),
-            load_runs=runs,
-            parallel_invariant=ctx.cp_size == 1,
+            store_runs=(run,) if ctx.tp_rank == 0 else (),
+            load_runs=(run,),
+            parallel_invariant=True,
+        )
+
+    if isinstance(spec, SlidingWindowMLASpec):
+        # 3-D contiguous-inner real-payload slab.
+        # cp_size == 1, num_kv_heads == 1, total_kv_heads == 1.
+        # Rank 0 writes, all ranks load identity.
+        if ctx.cp_size != 1:
+            return None
+        if spec.num_kv_heads != 1 or ctx.total_kv_heads != 1:
+            return None
+        if not isinstance(kv_cache, torch.Tensor):
+            return None
+        page = spec.real_page_size_bytes
+        if page <= 0:
+            return None
+        if kv_cache.ndim != 3:
+            return None
+        if kv_cache.shape[0] != num_blocks:
+            return None
+        elem = kv_cache.element_size()
+        if kv_cache.stride()[2] != 1:
+            return None
+        D1, D2 = kv_cache.shape[1], kv_cache.shape[2]
+        if D1 * D2 * elem != page:
+            return None
+        # Inner dimension D2 contiguous; middle dimension packed with inner
+        if kv_cache.stride()[1] != D2:
+            return None
+        # Tolerate packed outer stride / storage offset — mapping offsets
+        # are page-relative.
+        run = MappedRun(0, 0, page, 1, page, page)
+        return CanonicalPageMapping(
+            canonical_page_size_bytes=page,
+            local_page_size_bytes=page,
+            store_runs=(run,) if ctx.tp_rank == 0 else (),
+            load_runs=(run,),
+            parallel_invariant=True,
         )
 
     if spec.kv_quant_mode.is_per_token_head or not isinstance(kv_cache, torch.Tensor):
