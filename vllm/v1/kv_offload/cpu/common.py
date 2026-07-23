@@ -1,8 +1,206 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, LoadStoreSpec
+
+if TYPE_CHECKING:
+    import torch
+
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_offload.base import CanonicalPageMapping
+
+
+@dataclass(frozen=True)
+class CompactLayerGeometry:
+    """Per-layer compact geometry derived from real runtime state.
+
+    Frozen transport/planner input only.  Carries the owner mapping,
+    byte extents, and GPU offset for one layer in a compact-enabled
+    group.  Not a shadow layout object graph.
+    """
+
+    layer_name: str
+    mapping: "CanonicalPageMapping"
+    local_page_size_bytes: int
+    canonical_page_size_bytes: int
+    canonical_offset: int
+    gpu_offset_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.canonical_offset < 0:
+            raise ValueError(
+                f"canonical_offset must be non-negative, got {self.canonical_offset}"
+            )
+        if self.local_page_size_bytes <= 0:
+            raise ValueError(
+                f"local_page_size_bytes must be positive, got "
+                f"{self.local_page_size_bytes}"
+            )
+        if self.canonical_page_size_bytes <= 0:
+            raise ValueError(
+                f"canonical_page_size_bytes must be positive, got "
+                f"{self.canonical_page_size_bytes}"
+            )
+        if self.gpu_offset_bytes < 0:
+            raise ValueError(
+                f"gpu_offset_bytes must be non-negative, got {self.gpu_offset_bytes}"
+            )
+
+
+@dataclass(frozen=True)
+class CompactGroupGeometry:
+    """Per-group compact geometry: ordered layers with row stride and extents.
+
+    Frozen transport/planner input only.  A present group must be complete,
+    ordered, and certified by construction (no ``certified`` boolean).
+    ``parallel_invariant`` is True when every layer's mapping is
+    parallel-invariant (the canonical bytes are identical under any parallel
+    configuration with the same block span).
+    """
+
+    layers: tuple[CompactLayerGeometry, ...]
+    gpu_row_stride: int
+    local_extent: int
+    canonical_extent: int
+    parallel_invariant: bool
+
+    def __post_init__(self) -> None:
+        if not self.layers:
+            raise ValueError("layers tuple must be non-empty")
+        if self.gpu_row_stride <= 0:
+            raise ValueError(
+                f"gpu_row_stride must be positive, got {self.gpu_row_stride}"
+            )
+        if self.local_extent <= 0:
+            raise ValueError(f"local_extent must be positive, got {self.local_extent}")
+        if self.canonical_extent <= 0:
+            raise ValueError(
+                f"canonical_extent must be positive, got {self.canonical_extent}"
+            )
+
+
+def derive_compact_group_geometry(
+    kv_cache_config: "KVCacheConfig",
+    mappings: dict[str, "CanonicalPageMapping"],
+    kv_caches: dict[str, "torch.Tensor"],
+    layer_is_packed: dict[str, bool],
+) -> tuple[CompactGroupGeometry | None, ...]:
+    """Derive per-group compact geometry.  One entry per group; ``None``
+    means incomplete or nonpacked (not yet supported).  Present groups
+    certified by construction.  Contradictions raise ``ValueError``."""
+    import torch
+
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVCacheTensor,
+        UniformTypeKVCacheSpecs,
+    )
+
+    # layer → KVCacheTensor; reject ambiguity via None sentinel.
+    t_by_layer: dict[str, KVCacheTensor | None] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        for ln in tensor.shared_by:
+            t_by_layer[ln] = None if ln in t_by_layer else tensor
+
+    result: list[CompactGroupGeometry | None] = []
+    for group in kv_cache_config.kv_cache_groups:
+        gspec = group.kv_cache_spec
+        per_specs = (
+            gspec.kv_cache_specs if isinstance(gspec, UniformTypeKVCacheSpecs) else {}
+        )
+
+        # Nonpacked groups are not yet an honest multi-layer representation.
+        # This foundation targets hardware-proven packed DSV4.
+        if any(not layer_is_packed.get(ln, False) for ln in group.layer_names):
+            result.append(None)
+            continue
+
+        geoms: list[CompactLayerGeometry] = []
+        coff = 0
+        bad = False
+        for ln in group.layer_names:
+            spec = per_specs.get(ln, gspec)
+            if not isinstance(spec, AttentionSpec):
+                bad = True
+                break
+            mapping = mappings.get(ln)
+            if mapping is None:
+                bad = True
+                break
+            rt = kv_caches.get(ln)
+            if rt is None or not isinstance(rt, torch.Tensor):
+                bad = True
+                break
+            kv_t = t_by_layer.get(ln)
+            if kv_t is None:
+                bad = True
+                break
+
+            gpu_off = kv_t.offset
+            roff = rt.storage_offset() * rt.element_size()
+            if roff != kv_t.offset:
+                raise ValueError(
+                    f"Packed storage_offset {roff} != KVCacheTensor.offset "
+                    f"{kv_t.offset} for {ln!r}"
+                )
+
+            geoms.append(
+                CompactLayerGeometry(
+                    layer_name=ln,
+                    mapping=mapping,
+                    local_page_size_bytes=mapping.local_page_size_bytes,
+                    canonical_page_size_bytes=mapping.canonical_page_size_bytes,
+                    canonical_offset=coff,
+                    gpu_offset_bytes=gpu_off,
+                )
+            )
+            coff += mapping.canonical_page_size_bytes
+
+        if bad or not geoms:
+            result.append(None)
+            continue
+
+        kvt = t_by_layer.get(group.layer_names[0])
+        assert isinstance(kvt, KVCacheTensor)
+        stride = kvt.block_stride
+        for ln in group.layer_names[1:]:
+            kv2 = t_by_layer.get(ln)
+            if isinstance(kv2, KVCacheTensor) and kv2.block_stride != stride:
+                raise ValueError(
+                    f"Inconsistent packed block_stride for {ln!r}: "
+                    f"{kv2.block_stride} != {stride}"
+                )
+
+        # Validate byte spans within [0, block_stride), non-overlapping.
+        sl = sorted(geoms, key=lambda x: (x.gpu_offset_bytes, x.layer_name))
+        for i, g in enumerate(sl):
+            e = g.gpu_offset_bytes + g.local_page_size_bytes
+            if e > stride:
+                raise ValueError(
+                    f"Layer span [{g.gpu_offset_bytes},{e})"
+                    f" exceeds block_stride={stride}"
+                )
+            if i:
+                pe = sl[i - 1].gpu_offset_bytes + sl[i - 1].local_page_size_bytes
+                if pe > g.gpu_offset_bytes:
+                    raise ValueError(
+                        f"Overlap: {sl[i - 1].layer_name}@{pe}>"
+                        f"{g.layer_name}@{g.gpu_offset_bytes}"
+                    )
+
+        result.append(
+            CompactGroupGeometry(
+                layers=tuple(geoms),
+                gpu_row_stride=stride,
+                local_extent=sum(g.local_page_size_bytes for g in geoms),
+                canonical_extent=sum(g.canonical_page_size_bytes for g in geoms),
+                parallel_invariant=all(g.mapping.parallel_invariant for g in geoms),
+            )
+        )
+
+    return tuple(result)
 
 
 class CPUOffloadingMetrics:
