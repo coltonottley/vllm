@@ -1284,3 +1284,320 @@ def test_worker_compact_load_route(mocker):
     finally:
         worker.shutdown()
         mmap_region.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Permanent regressions: exact positional src/dst pointer verification
+# and real CUDA byte round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_compact_descriptor_exact_src_dst_pointers(mocker):
+    """Mocked compact descriptor transfer verifies exact positional
+    src/dst pointer arrays for both store and load.
+
+    The divergence ledger identifies the bug: the owner-aligned rewrite
+    passed ``fn(gpu_ptrs, cpu_ptrs, ...)`` regardless of direction, so
+    compact load always copied GPU→CPU instead of CPU→GPU.  This test
+    asserts that ``ops.swap_blocks_batch`` receives the correct pointer
+    arrays in the correct positional order for both directions.
+
+    For store (GPU→CPU):
+      - positional arg[0] (src_ptrs) must contain GPU tensor addresses
+      - positional arg[1] (dst_ptrs) must contain CPU mmap addresses
+
+    For load (CPU→GPU):
+      - positional arg[0] (src_ptrs) must contain CPU mmap addresses
+      - positional arg[1] (dst_ptrs) must contain GPU tensor addresses
+
+    Uses identity geometry with a single block so the mapping is
+    trivially verifiable: gpu_ptrs[0] == gpu_base_ptr + gpu_offset_bytes,
+    cpu_ptrs[0] == cpu_base_ptr + compact_address_byte_offset.
+    """
+
+    from vllm.v1.kv_offload.cpu.common import CompactCPULoadStoreSpec
+
+    gpu_row_stride = 1024
+    local_page_size = 1024
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(local_page_size)
+    geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
+
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+    gpu_tensor = torch.zeros(
+        num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+    )
+    cpu_tensor = torch.zeros(
+        num_cpu_blocks,
+        gpu_row_stride * blocks_per_chunk,
+        dtype=torch.int8,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
+
+    kv_cache_groups_data_refs = [
+        [
+            type("DR", (), dict(tensor_idx=0, page_size_bytes=gpu_row_stride))(),
+        ]
+    ]
+    for dr in kv_cache_groups_data_refs[0]:
+        dr.mapping = None
+
+    gpu_base_ptr = int(gpu_tensor.data_ptr())
+    cpu_base_ptr = int(cpu_tensor.data_ptr())
+
+    # Shared test body for both directions.
+    def _run_direction(gpu_to_cpu: bool) -> tuple:
+        """Run one compact transfer and return (captured_src, captured_dst)."""
+        handler = SingleDirectionOffloadingHandler(
+            gpu_tensors=[gpu_tensor],
+            cpu_tensors=[cpu_tensor],
+            blocks_per_chunk=blocks_per_chunk,
+            kv_cache_groups_data_refs=kv_cache_groups_data_refs,
+            gpu_to_cpu=gpu_to_cpu,
+            compact_geometry=geometry,
+        )
+
+        swap_mock = mocker.patch(
+            "vllm.v1.kv_offload.cpu.gpu_worker.ops.swap_blocks_batch"
+        )
+        handler._mmap_region = _mock_region_for_cpu_tensor(cpu_tensor)
+
+        gpu_block_ids = np.array([0], dtype=np.int64)
+        if gpu_to_cpu:
+            src_spec = GPULoadStoreSpec(
+                gpu_block_ids.tolist(),
+                group_sizes=(1,),
+                block_indices=(0,),
+            )
+            dst_spec = CompactCPULoadStoreSpec(
+                [_compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)]
+            )
+        else:
+            src_spec = CompactCPULoadStoreSpec(
+                [_compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)]
+            )
+            dst_spec = GPULoadStoreSpec(
+                gpu_block_ids.tolist(),
+                group_sizes=(1,),
+                block_indices=(0,),
+            )
+
+        handler.transfer_async(1, src_spec, dst_spec)
+        handler.shutdown()
+
+        assert swap_mock.called, (
+            f"swap_blocks_batch must be called (gpu_to_cpu={gpu_to_cpu})"
+        )
+        captured_src = int(swap_mock.call_args[0][0][0].item())
+        captured_dst = int(swap_mock.call_args[0][1][0].item())
+        return captured_src, captured_dst
+
+    store_src, store_dst = _run_direction(gpu_to_cpu=True)
+    load_src, load_dst = _run_direction(gpu_to_cpu=False)
+
+    # For store: src=GPU region, dst=CPU region
+    assert gpu_base_ptr <= store_src < gpu_base_ptr + gpu_tensor.numel(), (
+        f"Store src_ptrs[0]={store_src:#x} must be in GPU tensor range "
+        f"[{gpu_base_ptr:#x}, {gpu_base_ptr + gpu_tensor.numel():#x})"
+    )
+    assert cpu_base_ptr <= store_dst < cpu_base_ptr + cpu_tensor.numel(), (
+        f"Store dst_ptrs[0]={store_dst:#x} must be in CPU tensor range "
+        f"[{cpu_base_ptr:#x}, {cpu_base_ptr + cpu_tensor.numel():#x})"
+    )
+
+    # For load: src=CPU region, dst=GPU region
+    assert cpu_base_ptr <= load_src < cpu_base_ptr + cpu_tensor.numel(), (
+        f"Load src_ptrs[0]={load_src:#x} must be in CPU tensor range "
+        f"[{cpu_base_ptr:#x}, {cpu_base_ptr + cpu_tensor.numel():#x})"
+    )
+    assert gpu_base_ptr <= load_dst < gpu_base_ptr + gpu_tensor.numel(), (
+        f"Load dst_ptrs[0]={load_dst:#x} must be in GPU tensor range "
+        f"[{gpu_base_ptr:#x}, {gpu_base_ptr + gpu_tensor.numel():#x})"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_compact_byte_round_trip():
+    """Real CUDA compact byte round-trip without mocks.
+
+    Seeds GPU with nonzero pattern, compact stores to CPU, overwrites
+    GPU with a different pattern, compact loads back, and asserts exact
+    byte-level GPU equality.  This catches the direction bug that the
+    divergence ledger's mocked tests missed: if compact load copies
+    GPU→CPU instead of CPU→GPU, GPU bytes remain overwritten and the
+    final assertion fails.
+
+    Uses a single-block identity mapping with ``blocks_per_chunk=1``
+    for the simplest possible round-trip.
+    """
+    import uuid
+
+    from vllm.v1.kv_offload.cpu.common import CompactCPULoadStoreSpec
+
+    gpu_row_stride = 4096
+    local_page_size = 4096
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(local_page_size)
+    geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
+
+    num_gpu_blocks = 8
+    num_cpu_blocks = 32
+    kv_cache_tensors: list[CanonicalKVCacheTensor] = [
+        CanonicalKVCacheTensor(
+            tensor=torch.zeros(
+                num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+            ),
+            page_size_bytes=gpu_row_stride,
+        )
+    ]
+    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]] = [
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=gpu_row_stride)]
+    ]
+    kv_caches = CanonicalKVCaches(
+        tensors=kv_cache_tensors,
+        group_data_refs=kv_cache_groups_data_refs,
+    )
+
+    cpu_page_size = gpu_row_stride * blocks_per_chunk
+    worker = None
+    mmap_region = None
+    try:
+        mmap_region = SharedOffloadRegion(
+            engine_id=str(uuid.uuid4()),
+            num_blocks=num_cpu_blocks,
+            rank=0,
+            kv_bytes_per_block=cpu_page_size,
+            cpu_page_size=cpu_page_size,
+        )
+
+        worker = CPUOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=blocks_per_chunk,
+            num_cpu_blocks=num_cpu_blocks,
+            mmap_region=mmap_region,
+        )
+        worker.configure_compact_geometry(geometry)
+
+        gpu_tensor = kv_cache_tensors[0].tensor  # (num_gpu_blocks, row_stride), int8
+
+        # Phase 1: Seed GPU with nonzero pattern A (0x42).
+        pattern_a = torch.full_like(gpu_tensor, 0x42, dtype=torch.int8, device="cuda")
+        gpu_tensor.copy_(pattern_a)
+        assert torch.equal(gpu_tensor, pattern_a), "GPU must be seeded with pattern A"
+
+        # Phase 2: Compact store GPU → CPU.
+        gpu_block_ids = [0]
+        store_src = GPULoadStoreSpec(
+            gpu_block_ids,
+            group_sizes=(1,),
+            block_indices=(0,),
+        )
+        store_dst = CompactCPULoadStoreSpec(
+            [_compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)]
+        )
+        assert worker.submit_store(101, store_src, store_dst), "store must submit"
+
+        # Wait for store completion.
+        import time
+
+        end_time = time.time() + 10
+        while time.time() < end_time:
+            finished = worker.get_finished()
+            if finished:
+                assert finished[0].success
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("compact store did not complete within 10 s")
+
+        # Phase 3: Overwrite GPU with pattern B (0x7F).
+        pattern_b = torch.full_like(gpu_tensor, 0x7F, dtype=torch.int8, device="cuda")
+        gpu_tensor.copy_(pattern_b)
+        assert torch.equal(gpu_tensor, pattern_b), (
+            "GPU must be overwritten with pattern B"
+        )
+
+        # Phase 4: Compact load CPU → GPU (restore pattern A).
+        load_src = CompactCPULoadStoreSpec(
+            [_compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)]
+        )
+        load_dst = GPULoadStoreSpec(
+            gpu_block_ids,
+            group_sizes=(1,),
+            block_indices=(0,),
+        )
+        assert worker.submit_load(102, load_src, load_dst), "load must submit"
+
+        end_time = time.time() + 10
+        while time.time() < end_time:
+            finished = worker.get_finished()
+            if finished:
+                assert finished[0].success
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("compact load did not complete within 10 s")
+
+        # Phase 5: Verify GPU is restored to pattern A.
+        assert torch.equal(gpu_tensor[:1], pattern_a[:1]), (
+            "GPU block 0 must be restored to pattern A after compact load"
+        )
+
+        # GPU blocks that were NOT in the round-trip should remain pattern B.
+        assert torch.equal(gpu_tensor[1:], pattern_b[1:]), (
+            "GPU blocks 1+ must remain pattern B (not touched by load)"
+        )
+
+        # Also verify CPU stored the correct data by checking that the
+        # compact CPU region contains pattern A at the expected offset.
+        cpu_loaded = torch.frombuffer(
+            memoryview(
+                mmap_region.mmap_obj  # type: ignore[arg-type]
+            ),
+            dtype=torch.int8,
+            offset=0,  # compact_address.byte_offset == 0
+            count=local_page_size * blocks_per_chunk,
+        ).clone()
+        expected_cpu = pattern_a[:1].cpu().flatten()
+        torch.testing.assert_close(cpu_loaded, expected_cpu)
+
+    finally:
+        if worker is not None:
+            worker.shutdown()
+        if mmap_region is not None:
+            mmap_region.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Hardware acceptance requirement: TP2 writer/nonwriter compact coverage
+# ---------------------------------------------------------------------------
+
+# Real TP2 (two-rank compact store/load with writer/nonwriter roles and
+# all-rank load) cannot be tested honestly in the existing unit-test
+# suite because there is no distributed runtime or NCCL test fixture
+# available.  A fake single-process "TP2" test that duplicates local
+# state would not exercise the cross-rank consensus, shared-region
+# partitioning, rank-conditional store gating, or per-rank CPU→GPU load
+# that real TP2 requires.
+#
+# Until TP2 hardware acceptance is added to a separate distributed test:
+#
+#   1. Deploy the fixed candidate to TP2 with two physical ranks.
+#   2. Run a warm 50K-token CPU-hop replay.
+#   3. Verify:
+#      - writer rank stores nonzero bytes through compact path.
+#      - nonwriter rank produces zero-byte store completion (store
+#        gated by _is_store_writer) through the zero-descriptor path.
+#      - both ranks complete compact load with nonzero bytes and
+#        recover exact rank-local KV content.
+#      - exact replay output, same PID, zero errors.
+#      - external tokens are fully resolved (no zero local hit rate).
