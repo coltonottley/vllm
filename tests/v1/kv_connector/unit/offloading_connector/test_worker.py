@@ -11,6 +11,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     TransferJob,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+    OffloadingConnectorWorker,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -27,8 +30,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
+    CanonicalPageMapping,
     GPULoadStoreSpec,
     LoadStoreSpec,
+    MappedRun,
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
@@ -39,6 +44,12 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.common import (
+    CompactGroupGeometry,
+    CompactLayerGeometry,
+    derive_compact_group_geometry,
+)
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
 NUM_BLOCKS = 10
 BLOCK_SIZE = 16
@@ -641,3 +652,290 @@ def test_register_kv_caches_uniform_type(backend):
     assert group_refs[1] == CanonicalKVCacheRef(
         tensor_idx=1, page_size_bytes=spec_b.page_size_bytes
     )
+
+
+# Compact geometry tests
+
+
+class CompactRecordingWorker(CPUOffloadingWorker):
+    def __init__(self):
+        self._compact_geometry = None
+        self.configure_calls: list[tuple[CompactGroupGeometry | None, ...]] = []
+
+    def configure_compact_geometry(self, groups):
+        self.configure_calls.append(groups)
+        super().configure_compact_geometry(groups)
+
+
+def _mock_vllm_config():
+    c = VllmConfig(
+        device_config=DeviceConfig("cpu"),
+        parallel_config=ParallelConfig(),
+    )
+    c.model_config = MagicMock()
+    c.model_config.get_total_num_kv_heads.return_value = 4
+    return c
+
+
+def test_compact_geometry_types_and_one_shot():
+    run = MappedRun(0, 0, 64, 1, 64, 64)
+    mapping = CanonicalPageMapping(64, 64, (run,), (run,), True)
+    with pytest.raises(ValueError, match="non-negative"):
+        CompactLayerGeometry("l", mapping, 64, 64, -1, 0)
+    layer = CompactLayerGeometry("l", mapping, 64, 64, 0, 0)
+    with pytest.raises(ValueError, match="non-empty"):
+        CompactGroupGeometry((), 64, 64, 64, True)
+    group = CompactGroupGeometry((layer,), 64, 64, 64, True)
+    worker = CompactRecordingWorker()
+    worker.configure_compact_geometry((group,))
+    assert worker._compact_geometry == (group,)
+    with pytest.raises(RuntimeError, match="one-shot"):
+        worker.configure_compact_geometry((group,))
+
+
+def _pk_spec():
+    return MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        page_size_padded=8192,
+        compress_ratio=2,
+        indexes_kv_by_block_stride=True,
+    )
+
+
+def _pk_cfg(spec, layers_by_offset):
+    specs = {ln: spec for names in layers_by_offset.values() for ln in names}
+    group = KVCacheGroupSpec(
+        layer_names=list(specs),
+        kv_cache_spec=UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs),
+    )
+    tensors = [
+        KVCacheTensor(size=8192 * 4, shared_by=names, offset=off, block_stride=8192)
+        for off, names in layers_by_offset.items()
+    ]
+    return KVCacheConfig(
+        num_blocks=4, kv_cache_tensors=tensors, kv_cache_groups=[group]
+    )
+
+
+def _pk_views(config):
+    size = max(t.block_stride * config.num_blocks for t in config.kv_cache_tensors)
+    storage = torch.zeros(size, dtype=torch.uint8)
+    return {
+        ln: torch.as_strided(
+            storage, (config.num_blocks, 64), (t.block_stride, 1), t.offset
+        )
+        for t in config.kv_cache_tensors
+        for ln in t.shared_by
+    }
+
+
+def test_derive_compact_group_geometry_errors():
+    run = MappedRun(0, 0, 64, 1, 64, 64)
+    m = CanonicalPageMapping(64, 64, (run,), (run,), True)
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    pk = _pk_spec()
+    ma = MambaSpec(block_size=16, shapes=((16, 64),), dtypes=(torch.float16,))
+    c0 = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(size=1024, shared_by=["attn.0"]),
+            KVCacheTensor(size=4352, shared_by=["mamba.0"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["attn.0", "mamba.0"],
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=16, kv_cache_specs={"attn.0": attn, "mamba.0": ma}
+                ),
+            )
+        ],
+    )
+    assert derive_compact_group_geometry(
+        c0,
+        {"attn.0": m},
+        {
+            "attn.0": torch.zeros(4, 256, dtype=torch.uint8),
+            "mamba.0": torch.zeros(4, 4352, dtype=torch.uint8),
+        },
+        {"attn.0": False, "mamba.0": False},
+    ) == (None,)
+    c1 = _pk_cfg(pk, {0: ["pk.0", "pk.1"]})
+    assert derive_compact_group_geometry(
+        c1,
+        {"pk.0": m},
+        {"pk.0": torch.zeros(4, 8192, dtype=torch.uint8)},
+        {"pk.0": True, "pk.1": True},
+    ) == (None,)
+    bad = torch.empty(4 * 8192 + 64, dtype=torch.uint8).as_strided(
+        (4, 8192), (8192, 1), 64
+    )
+    with pytest.raises(ValueError, match="Packed storage_offset"):
+        derive_compact_group_geometry(
+            c1,
+            {"pk.0": m},
+            {**_pk_views(c1), "pk.0": bad},
+            {"pk.0": True, "pk.1": True},
+        )
+    spk = MLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.uint8,
+        page_size_padded=128,
+        compress_ratio=2,
+        indexes_kv_by_block_stride=True,
+    )
+    cd = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(size=128 * 4, shared_by=["pk.0"], offset=0, block_stride=64)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["pk.0"],
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=8, kv_cache_specs={"pk.0": spk}
+                ),
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="exceeds block_stride"):
+        derive_compact_group_geometry(
+            cd,
+            {"pk.0": CanonicalPageMapping(128, 128, (run,), (run,), True)},
+            {"pk.0": torch.zeros(4, 128, dtype=torch.uint8)},
+            {"pk.0": True},
+        )
+    ce = _pk_cfg(pk, {0: ["pk.0"], 32: ["pk.1"]})
+    with pytest.raises(ValueError, match="Overlap"):
+        derive_compact_group_geometry(
+            ce,
+            {"pk.0": m, "pk.1": m},
+            _pk_views(ce),
+            {"pk.0": True, "pk.1": True},
+        )
+
+
+def test_derive_compact_group_geometry_success():
+    pk = _pk_spec()
+    run = MappedRun(0, 0, 64, 1, 64, 64)
+    m = CanonicalPageMapping(64, 64, (run,), (run,), True)
+    c = _pk_cfg(pk, {0: ["pk.0"], 64: ["pk.1"]})
+    g = derive_compact_group_geometry(
+        c,
+        {"pk.0": m, "pk.1": m},
+        _pk_views(c),
+        {"pk.0": True, "pk.1": True},
+    )[0]
+    assert g is not None and g.gpu_row_stride == 8192
+    assert g.layers[0].gpu_offset_bytes == 0
+    assert g.layers[1].gpu_offset_bytes == 64
+    assert g.layers[0].canonical_offset == 0
+    assert g.layers[1].canonical_offset == 64
+    assert g.parallel_invariant
+
+
+def test_register_kv_caches_compact_geometry():
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_config_packed
+    from vllm.v1.worker.utils import AttentionGroup
+
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    names0 = ["model.layers.0.self_attn", "model.layers.1.self_attn"]
+    names1 = ["model.layers.2.self_attn", "model.layers.3.self_attn"]
+    g0 = KVCacheGroupSpec(
+        layer_names=names0,
+        kv_cache_spec=UniformTypeKVCacheSpecs(
+            block_size=BLOCK_SIZE, kv_cache_specs={ln: spec for ln in names0}
+        ),
+    )
+    g1 = KVCacheGroupSpec(
+        layer_names=names1,
+        kv_cache_spec=UniformTypeKVCacheSpecs(
+            block_size=BLOCK_SIZE, kv_cache_specs={ln: spec for ln in names1}
+        ),
+    )
+    groups = [g0, g1]
+    nb, pts = _get_kv_cache_config_packed(_mock_vllm_config(), groups, 8 * 1024 * 1024)
+    bc = AttentionBackendEnum.CPU_ATTN.get_class()
+    kcc = KVCacheConfig(num_blocks=nb, kv_cache_tensors=pts, kv_cache_groups=groups)
+    ag = [
+        [
+            AttentionGroup(
+                backend=bc, layer_names=[ln], kv_cache_spec=spec, kv_cache_group_id=gi
+            )
+            for ln in gg.layer_names
+        ]
+        for gi, gg in enumerate(groups)
+    ]
+    kv = _allocate_and_reshape_kv_caches(kcc, ag, device=torch.device("cpu"))
+    rec = CompactRecordingWorker()
+    sm = MagicMock(spec=OffloadingSpec)
+    sm.replicated_layout = False
+    sm.config = MagicMock()
+    sm.config.parallel.rank = 0
+    sm.get_worker.return_value = rec
+    w = OffloadingConnectorWorker(
+        spec=sm, vllm_config=_mock_vllm_config(), kv_cache_config=kcc
+    )
+    w.register_kv_caches(kv)
+    assert isinstance(sm.get_worker.call_args[0][0], CanonicalKVCaches)
+    assert len(rec.configure_calls) == 1
+    geom = rec.configure_calls[0]
+    assert len(geom) == len(groups)
+    for gi, g in enumerate(geom):
+        assert g is not None
+        assert g.gpu_row_stride == pts[0].block_stride
+        assert g.parallel_invariant
+        for li, ln in enumerate(groups[gi].layer_names):
+            ly = g.layers[li]
+            kvt = next(t for t in pts if ln in t.shared_by)
+            assert ly.layer_name == ln
+            assert ly.gpu_offset_bytes == kvt.offset
+            assert ly.local_page_size_bytes == spec.page_size_bytes
+            assert ly.canonical_page_size_bytes == spec.page_size_bytes
+            assert ly.canonical_offset == li * spec.page_size_bytes
+            assert ly.mapping.parallel_invariant
+
+
+def test_register_kv_caches_plugin_no_geometry():
+    spec = MagicMock(spec=OffloadingSpec)
+    spec.replicated_layout = False
+    spec.config = MagicMock()
+    spec.config.parallel.rank = 0
+    spec.get_worker.return_value = MagicMock(spec=OffloadingWorker)
+    attn = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    cfg = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(size=attn.page_size_bytes * NUM_BLOCKS, shared_by=["attn.0"])
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn)],
+    )
+    OffloadingConnectorWorker(
+        spec=spec, vllm_config=_mock_vllm_config(), kv_cache_config=cfg
+    ).register_kv_caches(
+        {
+            "attn.0": torch.zeros(
+                NUM_BLOCKS, attn.page_size_bytes, dtype=torch.uint8, device="cpu"
+            )
+        }
+    )
+    assert spec.get_worker.called
+    assert isinstance(spec.get_worker.call_args[0][0], CanonicalKVCaches)
+    assert not hasattr(spec.get_worker.return_value, "_compact_geometry")

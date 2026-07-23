@@ -23,6 +23,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu.common import CompactGroupGeometry
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -532,6 +533,9 @@ class CPUOffloadingWorker(OffloadingWorker):
         # The compact planner needs the full base, not handler-private traversal.
         self._mmap_region: SharedOffloadRegion | None = mmap_region
 
+        # Compact geometry: set once via configure_compact_geometry().
+        self._compact_geometry: tuple[CompactGroupGeometry | None, ...] | None = None
+
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
@@ -555,3 +559,19 @@ class CPUOffloadingWorker(OffloadingWorker):
         self._store_handler.shutdown()
         self._load_handler.shutdown()
         self._mmap_region = None
+        self._compact_geometry = None
+
+    def configure_compact_geometry(
+        self, groups: tuple[CompactGroupGeometry | None, ...]
+    ) -> None:
+        """Accept compact geometry exactly once while unset.
+
+        Stores the geometry as an immutable tuple.  Rejects a second
+        call even if the argument is equal.
+        """
+        if self._compact_geometry is not None:
+            raise RuntimeError(
+                "compact geometry is already configured and may not be "
+                "replaced; one-shot configuration expected."
+            )
+        self._compact_geometry = groups

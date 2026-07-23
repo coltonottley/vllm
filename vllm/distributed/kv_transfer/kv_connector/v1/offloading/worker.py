@@ -31,6 +31,8 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadingWorker,
 )
+from vllm.v1.kv_offload.cpu.common import derive_compact_group_geometry
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.sharding import derive_canonical_mappings
 
 logger = init_logger(__name__)
@@ -170,6 +172,11 @@ class OffloadingConnectorWorker:
                     ],
                 )
             )
+            if isinstance(self.worker, CPUOffloadingWorker):
+                compact_geometry = derive_compact_group_geometry(
+                    kv_cache_config, mappings, kv_caches, layer_is_packed
+                )
+                self.worker.configure_compact_geometry(compact_geometry)
             return
 
         block_tensors: list[CanonicalKVCacheTensor] = []
@@ -239,6 +246,11 @@ class OffloadingConnectorWorker:
         )
 
         self._init_worker(canonical_kv_caches)
+        if isinstance(self.worker, CPUOffloadingWorker):
+            compact_geometry = derive_compact_group_geometry(
+                kv_cache_config, mappings, kv_caches, layer_is_packed
+            )
+            self.worker.configure_compact_geometry(compact_geometry)
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
