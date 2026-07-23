@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from typing_extensions import override
 
@@ -107,6 +107,58 @@ class ARCCachePolicy(CachePolicy):
         self.b1.clear()
         self.b2.clear()
         self.target_t1_size = 0.0
+
+    @property
+    @override
+    def is_empty(self) -> bool:
+        return len(self.t1) == 0 and len(self.t2) == 0
+
+    @override
+    def select_evict_until(
+        self,
+        can_fit: "Callable[[list[tuple[OffloadKey, BlockStatus]]], bool]",
+        protected: set[OffloadKey],
+        prefer_evict: "Callable[[OffloadKey], bool] | None" = None,
+    ) -> list[tuple[OffloadKey, BlockStatus]] | None:
+        """Non-mutating oldest-first candidate selection.
+
+        Walks T1 then T2 (or T2 when target_t1_size is exceeded) in
+        insertion order. Within each partition, preferred candidates
+        are offered before normal ones. Preferred keys NEVER appear
+        again in the normal pass. Returns candidates if
+        can_fit returns True; does NOT mutate policy state.
+        """
+        candidates: list[tuple[OffloadKey, BlockStatus]] = []
+        already_selected: set[OffloadKey] = set()
+
+        def _walk(
+            source: OrderedDict[OffloadKey, BlockStatus],
+            pred: "Callable[[OffloadKey], bool] | None",
+        ) -> bool:
+            for key, block in source.items():
+                if block.ref_cnt != 0 or key in protected:
+                    continue
+                if pred is not None and not pred(key):
+                    continue
+                if key in already_selected:
+                    continue
+                candidates.append((key, block))
+                already_selected.add(key)
+                if can_fit(candidates):
+                    return True
+            return False
+
+        # Walk T1 first (or T2 when target exceeded), with preferred pass.
+        if len(self.t1) >= int(self.target_t1_size):
+            if prefer_evict is not None and _walk(self.t1, prefer_evict):
+                return candidates
+            if _walk(self.t1, None):
+                return candidates
+        if prefer_evict is not None and _walk(self.t2, prefer_evict):
+            return candidates
+        if _walk(self.t2, None):
+            return candidates
+        return None
 
     @override
     def evict(
