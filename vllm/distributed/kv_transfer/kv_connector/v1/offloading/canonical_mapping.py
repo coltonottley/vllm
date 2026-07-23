@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
@@ -264,22 +265,65 @@ def _layer_mapping(
         return None
 
     if isinstance(spec, MLAAttentionSpec):
-        # TP-replicated latent; CP shards its tokens across the DCP groups
-        if (
-            spec.compress_ratio != 1
-            or page % bs
-            or ctx.tp_size % ctx.dcp_size
-            or spec.kv_quant_mode.is_per_token_head
-        ):
+        if spec.compress_ratio == 1:
+            # TP-replicated latent; CP shards its tokens across the DCP groups
+            if page % bs or ctx.tp_size % ctx.dcp_size or spec.kv_quant_mode.is_per_token_head:
+                return None
+            row = page // bs
+            return CanonicalPageMapping(
+                canonical_page_size_bytes=ctx.cp_size * page,
+                local_page_size_bytes=page,
+                runs=_interleave_cp_tokens([ByteRegion(0, 0, row, row)], bs, ctx),
+                num_writers=ctx.tp_size // ctx.dcp_size,
+                writer_index=ctx.tp_rank // ctx.dcp_size,
+                parallelism_agnostic=ctx.cp_size == 1,
+            )
+
+        # Compressed MLA: TP-replicated latent with compress_ratio > 1.
+        # All ranks hold identical bytes; rotating-writer election spreads
+        # store traffic.  No CP (cp_size == 1) because compressed slots
+        # are not 1:1 with tokens.
+        if ctx.cp_size != 1 or spec.kv_quant_mode.is_per_token_head or page <= 0:
             return None
-        row = page // bs
         return CanonicalPageMapping(
-            canonical_page_size_bytes=ctx.cp_size * page,
+            canonical_page_size_bytes=page,
             local_page_size_bytes=page,
-            runs=_interleave_cp_tokens([ByteRegion(0, 0, row, row)], bs, ctx),
-            num_writers=ctx.tp_size // ctx.dcp_size,
-            writer_index=ctx.tp_rank // ctx.dcp_size,
-            parallelism_agnostic=ctx.cp_size == 1,
+            runs=(CopyRun(0, 0, page, 1, page, page),),
+            num_writers=ctx.tp_size,
+            writer_index=ctx.tp_rank,
+            parallelism_agnostic=True,
+        )
+
+    if isinstance(spec, SlidingWindowMLASpec):
+        # 3-D contiguous-inner real-payload slab.
+        # cp_size == 1, num_kv_heads == 1, total_kv_heads == 1.
+        # Rotating-writer election spreads store traffic across ranks.
+        if ctx.cp_size != 1 or spec.num_kv_heads != 1:
+            return None
+        if ctx.total_kv_heads != 1:
+            return None
+        if not isinstance(kv_cache, torch.Tensor):
+            return None
+        page = spec.real_page_size_bytes
+        if page <= 0:
+            return None
+        if kv_cache.ndim != 3 or kv_cache.shape[0] != num_blocks:
+            return None
+        elem = kv_cache.element_size()
+        if kv_cache.stride()[2] != 1:
+            return None
+        D1, D2 = kv_cache.shape[1], kv_cache.shape[2]
+        if D1 * D2 * elem != page:
+            return None
+        if kv_cache.stride()[1] != D2:
+            return None
+        return CanonicalPageMapping(
+            canonical_page_size_bytes=page,
+            local_page_size_bytes=page,
+            runs=(CopyRun(0, 0, page, 1, page, page),),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
         )
 
     if spec.kv_quant_mode.is_per_token_head or not isinstance(kv_cache, torch.Tensor):

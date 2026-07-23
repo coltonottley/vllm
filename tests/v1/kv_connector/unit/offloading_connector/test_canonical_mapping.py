@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
@@ -472,3 +473,198 @@ def test_derive_refuses_foreign_worker_groups():
         )
         == {}
     )
+
+
+# ---------------------------------------------------------------------------
+# Compressed MLA (compress_ratio > 1): TP-replicated, rank 0 writes
+# ---------------------------------------------------------------------------
+
+
+def test_compressed_mla_rank0_writer_tp_only():
+    """Compressed MLA with tp=2: rank 0 writes whole-page identity, rank 1 loads."""
+    spec = _mla_spec(compress_ratio=4)
+    # block_size=4, storage_block_size=1, page=1*1*64*1=64B
+    writer = _mapping(spec, None, _ctx(rank=0, tp=2))
+    reader = _mapping(spec, None, _ctx(rank=1, tp=2))
+    assert writer.canonical_page_size_bytes == 64
+    assert writer.local_page_size_bytes == 64
+    assert _triples(writer.store_runs) == [(0, 0, 64)]
+    assert _triples(writer.load_runs) == [(0, 0, 64)]
+    assert reader.store_runs == ()
+    assert _triples(reader.load_runs) == [(0, 0, 64)]
+    assert writer.parallel_invariant
+    assert reader.parallel_invariant
+
+
+def test_compressed_mla_dsv4_ratio_128():
+    """Compressed MLA with compress_ratio=128, DSV4-like geometry."""
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.int8,
+        compress_ratio=128,
+    )
+    # storage_block_size=2, page=2*1*512*1=1024B
+    writer = _mapping(spec, None, _ctx(rank=0, tp=4))
+    reader = _mapping(spec, None, _ctx(rank=3, tp=4))
+    assert writer.canonical_page_size_bytes == 1024
+    assert _triples(writer.store_runs) == [(0, 0, 1024)]
+    assert reader.store_runs == ()
+    assert reader.load_runs == writer.load_runs
+    assert writer.parallel_invariant
+
+
+def test_compressed_mla_byte_roundtrip():
+    """Store via rank 0, load via rank 1: bytes survive cleanly."""
+    spec = _mla_spec(compress_ratio=4)
+    rank0 = _mapping(spec, None, _ctx(rank=0, tp=2))
+    rank1 = _mapping(spec, None, _ctx(rank=1, tp=2))
+    ref = bytes((11 + 7 * i) % 256 for i in range(64))
+    # rank 0 stores into canonical buffer
+    buf = bytearray(64)
+    for local, canonical, n in _triples(rank0.store_runs):
+        buf[canonical : canonical + n] = ref[local : local + n]
+    # rank 1 loads from canonical
+    page = bytearray(rank1.local_page_size_bytes)
+    for local, canonical, n in _triples(rank1.load_runs):
+        page[local : local + n] = buf[canonical : canonical + n]
+    assert bytes(page) == ref
+
+
+def test_compressed_mla_fail_closed():
+    """Compressed MLA fails closed with CP, per-token-head quant, negative page."""
+    spec = _mla_spec(compress_ratio=4)
+    # CP (dcp=2) not allowed for compressed MLA
+    assert _try_mapping(spec, None, _ctx(0, tp=2, dcp=2)) is None
+    # Per-token-head quant
+    quant = _mla_spec(compress_ratio=4, kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD)
+    assert _try_mapping(quant, None, _ctx(0, tp=2)) is None
+
+
+# ---------------------------------------------------------------------------
+# SlidingWindowMLASpec: 3-D contiguous-inner slab, rank 0 writes
+# ---------------------------------------------------------------------------
+
+
+def _swa_mla_spec(**kwargs) -> SlidingWindowMLASpec:
+    """Default SlidingWindowMLASpec: block_size=4, num_kv_heads=1, uint8."""
+    base = dict(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.int8,
+        sliding_window=128,
+    )
+    base.update(kwargs)
+    return SlidingWindowMLASpec(**base)
+
+
+def test_sliding_window_mla_identity():
+    """Basic 3-D contiguous slab, rank 0 writes, rank 1 loads."""
+    spec = _swa_mla_spec()
+    # SlidingWindowMLASpec page = storage_block_size * num_kv_heads * head_size
+    # with compress_ratio=1: page = 4 * 1 * 64 = 256B
+    cache = torch.zeros(NUM_BLOCKS, 4, 64, dtype=torch.int8)
+    writer = _mapping(spec, cache, _ctx(rank=0, tp=2, total=1))
+    reader = _mapping(spec, cache, _ctx(rank=1, tp=2, total=1))
+    assert writer.canonical_page_size_bytes == 256
+    assert _triples(writer.store_runs) == [(0, 0, 256)]
+    assert reader.store_runs == ()
+    assert _triples(reader.load_runs) == [(0, 0, 256)]
+    assert writer.parallel_invariant
+
+
+def test_sliding_window_mla_dsv4_fp8():
+    """DSV4 FP8 SWA: (N,64,584) slab with padded outer stride & storage offset."""
+    slab_dim = 64
+    inner_dim = 584
+    page = slab_dim * inner_dim  # 37376 for uint8
+    spec = SlidingWindowMLASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=4096,
+        compress_ratio=4,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+    )
+    assert spec.real_page_size_bytes == page
+    # Build a 1-D buffer and use as_strided to create padded outer stride
+    # with nonzero storage offset
+    padded_stride = page + 64  # outer stride larger than page
+    storage_size = (NUM_BLOCKS - 1) * padded_stride + page + 128
+    data = torch.zeros(storage_size, dtype=torch.uint8)
+    cache = torch.as_strided(
+        data,
+        size=(NUM_BLOCKS, slab_dim, inner_dim),
+        stride=(padded_stride, inner_dim, 1),
+        storage_offset=32,
+    )
+    assert cache.storage_offset() == 32
+    assert cache.stride()[0] == padded_stride
+    mapping = _mapping(spec, cache, _ctx(rank=0, tp=2, total=1))
+    assert mapping.canonical_page_size_bytes == page
+    assert _triples(mapping.store_runs) == [(0, 0, page)]
+    assert mapping.parallel_invariant
+
+
+def test_sliding_window_mla_byte_roundtrip():
+    """SWA MLA store/load roundtrip via identity mapping."""
+    spec = _swa_mla_spec()
+    cache = torch.zeros(NUM_BLOCKS, 4, 64, dtype=torch.int8)
+    rank0 = _mapping(spec, cache, _ctx(rank=0, tp=2, total=1))
+    rank1 = _mapping(spec, cache, _ctx(rank=1, tp=2, total=1))
+    ref = bytes((13 + 5 * i) % 256 for i in range(256))
+    buf = bytearray(256)
+    for local, canonical, n in _triples(rank0.store_runs):
+        buf[canonical : canonical + n] = ref[local : local + n]
+    page = bytearray(rank1.local_page_size_bytes)
+    for local, canonical, n in _triples(rank1.load_runs):
+        page[local : local + n] = buf[canonical : canonical + n]
+    assert bytes(page) == ref
+
+
+def test_sliding_window_mla_fail_closed():
+    """SlidingWindowMLASpec fails closed for CP, wrong heads, bad geometry."""
+    spec = _swa_mla_spec()
+    good = torch.zeros(NUM_BLOCKS, 4, 64, dtype=torch.int8)
+    # CP not allowed
+    assert _try_mapping(spec, good, _ctx(0, tp=2, dcp=2, total=1)) is None
+    # Wrong num_kv_heads (requires 1)
+    multi_head = _swa_mla_spec(num_kv_heads=2)
+    assert _try_mapping(multi_head, good, _ctx(0, tp=4, total=4)) is None
+    # Wrong total_kv_heads (requires 1)
+    assert _try_mapping(spec, good, _ctx(0, tp=2, total=2)) is None
+    # 2-D tensor (not 3-D)
+    flat = torch.zeros(NUM_BLOCKS, 256, dtype=torch.int8)
+    assert _try_mapping(spec, flat, _ctx(0, tp=2, total=1)) is None
+    # 4-D tensor
+    four_d = torch.zeros(NUM_BLOCKS, 4, 64, 1, dtype=torch.int8)
+    assert _try_mapping(spec, four_d, _ctx(0, tp=2, total=1)) is None
+    # Wrong inner stride (non-contiguous)
+    non_contig = torch.zeros(NUM_BLOCKS, 4, 64, dtype=torch.int8).transpose(1, 2)
+    # After transpose: shape (3, 64, 4), stride (256, 1, 64) — inner is packed
+    # but totalling to page=256 fails because D1*D2*elem != 256
+    assert _try_mapping(spec, non_contig, _ctx(0, tp=2, total=1)) is None
+    # Wrong outer dim (num_blocks mismatch)
+    wrong_blocks = torch.zeros(NUM_BLOCKS + 1, 4, 64, dtype=torch.int8)
+    assert _try_mapping(spec, wrong_blocks, _ctx(0, tp=2, total=1)) is None
+
+
+# ---------------------------------------------------------------------------
+# Generic attention unaffected by new branches
+# ---------------------------------------------------------------------------
+
+
+def test_generic_attention_works_alongside_new_branches():
+    """Pre-existing full-attention specs pass through the generic path."""
+    spec = _full_spec()
+    cache = _split_nhd_cache(spec)
+    mapping = _mapping(spec, cache, _ctx(rank=0, tp=2))
+    # K + V regions, each 4 tokens x 2 heads x 128B = 1024B; 2 regions
+    assert mapping.canonical_page_size_bytes == 2 * 1024
+    # 8 fragments: 4 tokens x 2 regions, canonical stride=2x local stride
+    assert len(_triples(mapping.store_runs)) == 8
+    assert mapping.store_runs == mapping.load_runs
