@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 import mmap
 import random
 import time
 import uuid
 
+import numpy as np
 import pytest
 import torch
 
@@ -19,7 +22,10 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu import gpu_worker
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import (
+    CompactCPULoadStoreSpec,
+    CPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
@@ -505,14 +511,13 @@ def test_worker_retains_mmap_region_reference():
         )
         assert worker._mmap_region is mmap_region
         worker.shutdown()
-        # After shutdown the worker-level ref must be None, and the region
-        # itself must be cleaned up (base_ptr 0, base_tensor None) by the
-        # store handler *before* the worker ref is cleared.
+        # Worker owns the shared region and cleans it exactly once after both
+        # direction handlers release their borrowed references.
         assert worker._mmap_region is None, (
             "worker._mmap_region must be None after shutdown"
         )
         assert mmap_region.base_ptr == 0, (
-            "mmap base_ptr must be 0 after shutdown (store handler cleaned up)"
+            "mmap base_ptr must be 0 after worker-owned shutdown"
         )
         assert mmap_region.base_tensor is None, (
             "mmap base_tensor must be None after shutdown"
@@ -535,8 +540,8 @@ def test_worker_without_mmap_region():
 
 
 @torch.inference_mode()
-def test_worker_mmap_region_reference_passed_to_store_handler():
-    """The mmap_region reference must be forwarded to the store handler."""
+def test_worker_mmap_region_reference_passed_to_both_handlers():
+    """Both directions borrow the same mmap; the worker owns cleanup."""
     kv_caches = _make_kv_caches()
     mmap_region = SharedOffloadRegion(
         engine_id=str(uuid.uuid4()),
@@ -552,12 +557,14 @@ def test_worker_mmap_region_reference_passed_to_store_handler():
             num_cpu_blocks=64,
             mmap_region=mmap_region,
         )
-        # The store handler owns cleanup of mmap_region via shutdown()
         assert worker._store_handler._mmap_region is mmap_region
+        assert worker._load_handler._mmap_region is mmap_region
         worker.shutdown()
+        assert worker._store_handler._mmap_region is None
+        assert worker._load_handler._mmap_region is None
+        assert mmap_region.base_ptr == 0
     finally:
-        # mmap region is cleaned up by store_handler.shutdown()
-        pass
+        mmap_region.cleanup()
 
 
 @torch.inference_mode()
@@ -576,3 +583,704 @@ def test_worker_fallback_pinned_tensors():
     for cpu_t in worker._store_handler.dst_tensors:
         assert cpu_t.is_pinned()
     worker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Compact descriptor transfer tests
+# ---------------------------------------------------------------------------
+
+
+def _compact_identity_mapping(
+    page_size: int,
+    *,
+    store_runs: tuple | None = None,
+):
+    """Build an identity ``CanonicalPageMapping`` for compact test helpers.
+    Single-fragment identity run covering the full page.
+    """
+    from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+
+    run = MappedRun(0, 0, page_size, 1, page_size, page_size)
+    s_runs = (run,) if store_runs is None else store_runs
+    return CanonicalPageMapping(
+        canonical_page_size_bytes=page_size,
+        local_page_size_bytes=page_size,
+        store_runs=s_runs,
+        load_runs=(run,),
+        parallel_invariant=True,
+    )
+
+
+def _compact_address(
+    byte_offset: int,
+    logical_length: int,
+    group_idx: int = 0,
+):
+    from vllm.v1.kv_offload.cpu.common import CompactCPUAddress
+
+    return CompactCPUAddress(
+        byte_offset=byte_offset,
+        logical_length=logical_length,
+        allocated_length=logical_length,
+        group_idx=group_idx,
+    )
+
+
+def _make_compact_geometry(
+    layer_names: list[str],
+    layer_mappings: list,
+    gpu_offset_bytes: list[int],
+    gpu_row_stride: int,
+):
+    from vllm.v1.kv_offload.cpu.common import (
+        CompactGroupGeometry,
+        CompactLayerGeometry,
+    )
+
+    canonical_offset = 0
+    layers: list[CompactLayerGeometry] = []
+    for ln, mapping, goff in zip(layer_names, layer_mappings, gpu_offset_bytes):
+        layers.append(
+            CompactLayerGeometry(
+                layer_name=ln,
+                mapping=mapping,
+                local_page_size_bytes=mapping.local_page_size_bytes,
+                canonical_page_size_bytes=mapping.canonical_page_size_bytes,
+                canonical_offset=canonical_offset,
+                gpu_offset_bytes=goff,
+            )
+        )
+        canonical_offset += mapping.canonical_page_size_bytes
+    local_extent = sum(m.local_page_size_bytes for m in layer_mappings)
+    canonical_extent = sum(m.canonical_page_size_bytes for m in layer_mappings)
+    return (
+        CompactGroupGeometry(
+            layers=tuple(layers),
+            gpu_row_stride=gpu_row_stride,
+            local_extent=local_extent,
+            canonical_extent=canonical_extent,
+            parallel_invariant=all(m.parallel_invariant for m in layer_mappings),
+        ),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_compact_nonwriter_zero_descriptors(mocker):
+    """Non-writer compact store (empty store_runs) produces zero descriptors
+    through the compact path.  swap_blocks_batch is NOT called but the
+    completion gate still registers job_id."""
+    gpu_row_stride = 1024
+    local_page_size = 1024
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(local_page_size, store_runs=())
+    geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
+
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+    gpu_tensor = torch.zeros(
+        num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+    )
+    cpu_tensor = torch.zeros(
+        num_cpu_blocks,
+        gpu_row_stride * blocks_per_chunk,
+        dtype=torch.int8,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
+
+    kv_cache_groups_data_refs = [
+        [
+            type("DR", (), dict(tensor_idx=0, page_size_bytes=gpu_row_stride))(),
+        ]
+    ]
+    for dr in kv_cache_groups_data_refs[0]:
+        dr.mapping = None
+
+    handler = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu_tensor],
+        cpu_tensors=[cpu_tensor],
+        blocks_per_chunk=blocks_per_chunk,
+        kv_cache_groups_data_refs=kv_cache_groups_data_refs,
+        gpu_to_cpu=True,
+        compact_geometry=geometry,
+    )
+
+    swap_mock = mocker.patch("vllm.v1.kv_offload.cpu.gpu_worker.ops.swap_blocks_batch")
+
+    handler._mmap_region = _mock_region_for_cpu_tensor(cpu_tensor)
+
+    gpu_block_ids = np.array([0], dtype=np.int64)
+    src_spec = GPULoadStoreSpec(
+        gpu_block_ids.tolist(),
+        group_sizes=(1,),
+        block_indices=(0,),
+    )
+    dst_spec = CompactCPULoadStoreSpec(
+        [_compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)]
+    )
+
+    result = handler.transfer_async(17, src_spec, dst_spec)
+    assert result is True
+
+    swap_mock.assert_not_called()
+    assert 17 in handler._transfer_events
+
+    handler.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_compact_routing_normal_batch_unchanged(mocker):
+    """Normal (non-compact) transfer_async still routes through the batch API,
+    even when compact geometry is configured.  The legacy path uses
+    default ``use_batch_api=True`` forwarding."""
+    gpu_row_stride = 1024
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(1024)
+    geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
+
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+    gpu_tensor = torch.zeros(
+        num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+    )
+    cpu_tensor = torch.zeros(
+        num_cpu_blocks,
+        gpu_row_stride * blocks_per_chunk,
+        dtype=torch.int8,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
+
+    kv_cache_groups_data_refs = [
+        [
+            type("DR", (), dict(tensor_idx=i, page_size_bytes=gpu_row_stride))()
+            for i in range(2)
+        ]
+    ]
+    for dr in kv_cache_groups_data_refs[0]:
+        dr.mapping = None
+
+    handler = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu_tensor, gpu_tensor.clone()],
+        cpu_tensors=[cpu_tensor, cpu_tensor.clone()],
+        blocks_per_chunk=blocks_per_chunk,
+        kv_cache_groups_data_refs=kv_cache_groups_data_refs,
+        gpu_to_cpu=True,
+        compact_geometry=geometry,
+    )
+
+    swap_mock = mocker.patch("vllm.v1.kv_offload.cpu.gpu_worker.ops.swap_blocks_batch")
+
+    gpu_block_ids = np.array([0], dtype=np.int64)
+    src_spec = GPULoadStoreSpec(
+        gpu_block_ids.tolist(),
+        group_sizes=(1,),
+        block_indices=(0,),
+    )
+    dst_spec = CPULoadStoreSpec([0])
+
+    result = handler.transfer_async(33, src_spec, dst_spec)
+    assert result is True
+
+    assert swap_mock.called, (
+        "swap_blocks_batch must be called for normal batch transfer"
+    )
+    _, kwargs = swap_mock.call_args
+    assert kwargs.get("use_batch_api") is True or "use_batch_api" not in kwargs, (
+        "legacy batch path must use default use_batch_api=True"
+    )
+
+    handler.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_compact_with_physical_spans(mocker):
+    """Compact transfer with fragmented physical spans."""
+    from vllm.v1.kv_offload.cpu.common import CompactCPUAddressSpan
+
+    gpu_row_stride = 1024
+    local_page_size = 1024
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(local_page_size)
+    geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
+
+    num_gpu_blocks = 8
+    num_cpu_blocks = 32
+    gpu_tensor = torch.zeros(
+        num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+    )
+    cpu_tensor = torch.zeros(
+        num_cpu_blocks,
+        gpu_row_stride * blocks_per_chunk,
+        dtype=torch.int8,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
+
+    kv_cache_groups_data_refs = [
+        [
+            type("DR", (), dict(tensor_idx=0, page_size_bytes=gpu_row_stride))(),
+        ]
+    ]
+    for dr in kv_cache_groups_data_refs[0]:
+        dr.mapping = None
+
+    handler = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu_tensor],
+        cpu_tensors=[cpu_tensor],
+        blocks_per_chunk=blocks_per_chunk,
+        kv_cache_groups_data_refs=kv_cache_groups_data_refs,
+        gpu_to_cpu=True,
+        compact_geometry=geometry,
+    )
+
+    swap_mock = mocker.patch("vllm.v1.kv_offload.cpu.gpu_worker.ops.swap_blocks_batch")
+
+    handler._mmap_region = _mock_region_for_cpu_tensor(cpu_tensor)
+
+    addr = _compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)
+    object.__setattr__(
+        addr,
+        "spans",
+        (
+            CompactCPUAddressSpan(0, 512, 512),
+            CompactCPUAddressSpan(4096, 512, 512),
+        ),
+    )
+
+    gpu_block_ids = np.array([0], dtype=np.int64)
+    src_spec = GPULoadStoreSpec(
+        gpu_block_ids.tolist(),
+        group_sizes=(1,),
+        block_indices=(0,),
+    )
+    dst_spec = CompactCPULoadStoreSpec([addr])
+
+    result = handler.transfer_async(77, src_spec, dst_spec)
+    assert result is True
+
+    assert swap_mock.called
+    _, kwargs = swap_mock.call_args
+    assert kwargs.get("use_batch_api") is False
+    assert 77 in handler._transfer_events
+
+    handler.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_compact_positional_group_mismatch():
+    """Positional group geometry is preserved: compact transfer raises
+    RuntimeError when geometry is None for a referenced group.
+
+    Tests both:
+    1. group_idx out of range
+    2. group_idx present but geometry is None (incomplete group)
+    """
+    gpu_row_stride = 1024
+    local_page_size = 1024
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(local_page_size)
+
+    # Positional geometry: group 1 is None (incomplete).
+    # Tuple preserves position: (full, None).
+    positional_geom = (
+        _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)[0],
+        None,
+    )
+
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+    gpu_tensor = torch.zeros(
+        num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+    )
+    cpu_tensor = torch.zeros(
+        num_cpu_blocks,
+        gpu_row_stride * blocks_per_chunk,
+        dtype=torch.int8,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    from vllm.v1.kv_offload.cpu.gpu_worker import SingleDirectionOffloadingHandler
+
+    kv_cache_groups_data_refs = [
+        [
+            type("DR", (), dict(tensor_idx=0, page_size_bytes=gpu_row_stride))(),
+        ]
+    ]
+    for dr in kv_cache_groups_data_refs[0]:
+        dr.mapping = None
+
+    handler = SingleDirectionOffloadingHandler(
+        gpu_tensors=[gpu_tensor],
+        cpu_tensors=[cpu_tensor],
+        blocks_per_chunk=blocks_per_chunk,
+        kv_cache_groups_data_refs=kv_cache_groups_data_refs,
+        gpu_to_cpu=True,
+        compact_geometry=positional_geom,
+    )
+
+    handler._mmap_region = _mock_region_for_cpu_tensor(cpu_tensor)
+
+    addr = _compact_address(0, local_page_size * blocks_per_chunk, group_idx=1)
+    gpu_block_ids = np.array([0], dtype=np.int64)
+    src_spec = GPULoadStoreSpec(
+        gpu_block_ids.tolist(),
+        group_sizes=(1,),
+        block_indices=(0,),
+    )
+    dst_spec = CompactCPULoadStoreSpec([addr])
+
+    with pytest.raises(RuntimeError, match="compact geometry is None"):
+        handler.transfer_async(55, src_spec, dst_spec)
+
+    addr2 = _compact_address(0, local_page_size * blocks_per_chunk, group_idx=2)
+    dst_spec2 = CompactCPULoadStoreSpec([addr2])
+
+    with pytest.raises(RuntimeError, match="out of range"):
+        handler.transfer_async(56, src_spec, dst_spec2)
+
+    handler.shutdown()
+
+
+def _mock_region_for_cpu_tensor(cpu_tensor: torch.Tensor) -> object:
+    """Build a minimal mock SharedOffloadRegion for the given CPU tensor.
+
+    Compact transfers now require ``_mmap_region`` to be set on the
+    handler; this helper creates an object with the expected public
+    interface (``base_ptr``, ``total_size_bytes``) pointing at the
+    tensor's backing storage.
+
+    Also provides a no-op ``cleanup()`` so handler shutdown does not
+    raise.
+    """
+
+    def _noop():
+        pass
+
+    return type(
+        "_MockRegion",
+        (),
+        {
+            "base_ptr": int(cpu_tensor.data_ptr()),
+            "total_size_bytes": int(cpu_tensor.numel()),
+            "cleanup": _noop,
+        },
+    )()
+
+
+# ---------------------------------------------------------------------------
+# CPU-testable: worker->both-handlers propagation without CUDA
+# ---------------------------------------------------------------------------
+
+
+def test_worker_compact_geometry_propagates_to_both_handlers_cpu():
+    """CPU-testable: ``CPUOffloadingWorker.configure_compact_geometry``
+    must one-shot propagate through each handler's public ``configure``
+    method.  This test runs without CUDA, proving propagation works
+    independent of GPU availability.
+
+    Pre-fix regression: at HEAD ``cdc9c2a9`` the worker's configure only
+    stores ``self._compact_geometry`` without calling the handlers, so
+    the handler-level assertions would fail.
+    """
+
+    from vllm.v1.kv_offload.cpu.common import (
+        CompactGroupGeometry,
+        CompactLayerGeometry,
+    )
+
+    m = _compact_identity_mapping(1024)
+    layer = CompactLayerGeometry(
+        layer_name="l0",
+        mapping=m,
+        local_page_size_bytes=1024,
+        canonical_page_size_bytes=1024,
+        canonical_offset=0,
+        gpu_offset_bytes=0,
+    )
+    geometry = (
+        CompactGroupGeometry(
+            layers=(layer,),
+            gpu_row_stride=1024,
+            local_extent=1024,
+            canonical_extent=1024,
+            parallel_invariant=True,
+        ),
+    )
+
+    # Create the worker object without calling __init__ (which needs CUDA),
+    # then wire up real-configured mock handlers to test propagation.
+    worker = object.__new__(CPUOffloadingWorker)
+
+    class _Handler:
+        """Minimal handler stub that mirrors configure_compact_geometry."""
+
+        def __init__(self):
+            self._compact_geometry = None
+
+        def configure_compact_geometry(self, groups):
+            if self._compact_geometry is not None:
+                raise RuntimeError(
+                    "compact geometry is already configured and may not be "
+                    "replaced; one-shot configuration expected."
+                )
+            self._compact_geometry = groups
+
+    worker._store_handler = _Handler()
+    worker._load_handler = _Handler()
+    worker._compact_geometry = None
+    worker._mmap_region = None
+
+    # Before configure: all three are None.
+    assert worker._compact_geometry is None
+    assert worker._store_handler._compact_geometry is None
+    assert worker._load_handler._compact_geometry is None
+
+    # Configure once.
+    worker.configure_compact_geometry(geometry)
+
+    # Worker stores it.
+    assert worker._compact_geometry is geometry
+    # Both handlers received it via their public configure method.
+    assert worker._store_handler._compact_geometry is geometry
+    assert worker._load_handler._compact_geometry is geometry
+
+    # Second call must reject.
+    import pytest
+
+    with pytest.raises(RuntimeError, match="already configured"):
+        worker.configure_compact_geometry(geometry)
+
+
+# ---------------------------------------------------------------------------
+# Full worker submit_store/submit_load compact route test (native op mocked)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_worker_compact_store_route(mocker):
+    """Full worker-level compact ``submit_store`` route through
+    ``_transfer_async_compact`` with native ``ops.swap_blocks_batch``
+    mocked only.  Verifies:
+
+    - Worker ``configure_compact_geometry`` propagates geometry.
+    - ``submit_store`` with ``CompactCPULoadStoreSpec`` routes through
+      compact path and calls ``ops.swap_blocks_batch`` (native) with
+      ``use_batch_api=False``.
+    - ``get_finished`` returns a completed result.
+    """
+    import uuid
+
+    from vllm.v1.kv_offload.cpu.common import CompactCPULoadStoreSpec
+
+    gpu_row_stride = 2048
+    local_page_size = 1024
+    blocks_per_chunk = 2
+
+    m0 = _compact_identity_mapping(local_page_size)
+    m1 = _compact_identity_mapping(local_page_size)
+    geometry = _make_compact_geometry(["l0", "l1"], [m0, m1], [0, 1024], gpu_row_stride)
+
+    num_gpu_blocks = 16
+    num_cpu_blocks = 32
+    kv_cache_tensors: list[CanonicalKVCacheTensor] = [
+        CanonicalKVCacheTensor(
+            tensor=torch.zeros(
+                num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+            ),
+            page_size_bytes=gpu_row_stride,
+        )
+    ]
+    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]] = [
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=gpu_row_stride)]
+    ]
+    kv_caches = CanonicalKVCaches(
+        tensors=kv_cache_tensors,
+        group_data_refs=kv_cache_groups_data_refs,
+    )
+
+    # Create shared mmap region for compact CPU backing.
+    cpu_page_size = gpu_row_stride * blocks_per_chunk
+    mmap_region = SharedOffloadRegion(
+        engine_id=str(uuid.uuid4()),
+        num_blocks=num_cpu_blocks,
+        rank=0,
+        kv_bytes_per_block=cpu_page_size,
+        cpu_page_size=cpu_page_size,
+    )
+
+    try:
+        worker = CPUOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=blocks_per_chunk,
+            num_cpu_blocks=num_cpu_blocks,
+            mmap_region=mmap_region,
+        )
+
+        # Configure compact geometry (propagates to both handlers).
+        worker.configure_compact_geometry(geometry)
+
+        # Mock only the native op.
+        swap_mock = mocker.patch(
+            "vllm.v1.kv_offload.cpu.gpu_worker.ops.swap_blocks_batch"
+        )
+
+        # Build a compact store spec.
+        gpu_block_ids = [0, 1]
+        src_spec = GPULoadStoreSpec(
+            gpu_block_ids,
+            group_sizes=(2,),
+            block_indices=(0,),
+        )
+        canonical_page_size = local_page_size * 2  # two layers
+        dst_spec = CompactCPULoadStoreSpec(
+            [_compact_address(0, canonical_page_size * blocks_per_chunk, group_idx=0)]
+        )
+
+        # Submit store.
+        result = worker.submit_store(42, src_spec, dst_spec)
+        assert result is True
+
+        # Native op must have been called with use_batch_api=False.
+        assert swap_mock.called, (
+            "ops.swap_blocks_batch must be called for compact store"
+        )
+        _, kwargs = swap_mock.call_args
+        assert kwargs.get("use_batch_api") is False, (
+            "compact path must use use_batch_api=False"
+        )
+
+        # Completion gate.
+        import time
+
+        end_time = time.time() + 10
+        finished = None
+        while time.time() < end_time:
+            finished = worker.get_finished()
+            if finished:
+                break
+            time.sleep(0.1)
+        assert finished, "compact store must complete"
+        assert finished[0].job_id == 42
+        assert finished[0].success
+        assert finished[0].transfer_size > 0
+
+    finally:
+        worker.shutdown()
+        mmap_region.cleanup()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_worker_compact_load_route(mocker):
+    """Full worker-level compact ``submit_load`` route through
+    ``_transfer_async_compact`` with native ``ops.swap_blocks_batch``
+    mocked only.  Verifies:
+
+    - ``submit_load`` with ``CompactCPULoadStoreSpec`` routes through
+      compact path and calls ``ops.swap_blocks_batch`` with
+      ``use_batch_api=False``.
+    - Completion gate works.
+    """
+    import uuid
+
+    from vllm.v1.kv_offload.cpu.common import CompactCPULoadStoreSpec
+
+    gpu_row_stride = 1024
+    local_page_size = 1024
+    blocks_per_chunk = 1
+
+    m = _compact_identity_mapping(local_page_size)
+    geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
+
+    num_gpu_blocks = 16
+    num_cpu_blocks = 32
+    kv_cache_tensors: list[CanonicalKVCacheTensor] = [
+        CanonicalKVCacheTensor(
+            tensor=torch.zeros(
+                num_gpu_blocks, gpu_row_stride, dtype=torch.int8, device="cuda"
+            ),
+            page_size_bytes=gpu_row_stride,
+        )
+    ]
+    kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]] = [
+        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=gpu_row_stride)]
+    ]
+    kv_caches = CanonicalKVCaches(
+        tensors=kv_cache_tensors,
+        group_data_refs=kv_cache_groups_data_refs,
+    )
+
+    cpu_page_size = gpu_row_stride * blocks_per_chunk
+    mmap_region = SharedOffloadRegion(
+        engine_id=str(uuid.uuid4()),
+        num_blocks=num_cpu_blocks,
+        rank=0,
+        kv_bytes_per_block=cpu_page_size,
+        cpu_page_size=cpu_page_size,
+    )
+
+    try:
+        worker = CPUOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=blocks_per_chunk,
+            num_cpu_blocks=num_cpu_blocks,
+            mmap_region=mmap_region,
+        )
+        worker.configure_compact_geometry(geometry)
+
+        swap_mock = mocker.patch(
+            "vllm.v1.kv_offload.cpu.gpu_worker.ops.swap_blocks_batch"
+        )
+
+        gpu_block_ids = [0]
+        src_spec = CompactCPULoadStoreSpec(
+            [_compact_address(0, local_page_size * blocks_per_chunk, group_idx=0)]
+        )
+        dst_spec = GPULoadStoreSpec(
+            gpu_block_ids,
+            group_sizes=(1,),
+            block_indices=(0,),
+        )
+
+        result = worker.submit_load(99, src_spec, dst_spec)
+        assert result is True
+
+        assert swap_mock.called
+        _, kwargs = swap_mock.call_args
+        assert kwargs.get("use_batch_api") is False, (
+            "compact load must use use_batch_api=False"
+        )
+
+        import time
+
+        end_time = time.time() + 10
+        finished = None
+        while time.time() < end_time:
+            finished = worker.get_finished()
+            if finished:
+                break
+            time.sleep(0.1)
+        assert finished, "compact load must complete"
+        assert finished[0].job_id == 99
+        assert finished[0].success
+
+    finally:
+        worker.shutdown()
+        mmap_region.cleanup()
