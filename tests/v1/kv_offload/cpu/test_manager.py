@@ -11,6 +11,7 @@ from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
     OffloadingEvent,
+    OffloadingGaugeMetadata,
     OffloadKey,
     PrepareStoreOutput,
     ReqContext,
@@ -22,6 +23,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 
 def make_req_context(
@@ -969,3 +971,419 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+# --- CPU_ALLOCATED_BYTES gauge tests (compact mode only) ---
+
+
+def _make_compact_manager(
+    num_blocks: int = 6,
+    compact_total: int = 24576,
+    compact_page: int = 4096,
+    group_payload: dict[int, int] | None = None,
+    store_threshold: int = 0,
+) -> CPUOffloadingManager:
+    """Create a compact-enabled CPUOffloadingManager for testing."""
+    if group_payload is None:
+        group_payload = {0: 4096}
+    mgr = CPUOffloadingManager(
+        num_blocks=num_blocks,
+        cache_policy="lru",
+        enable_events=False,
+        store_threshold=store_threshold,
+    )
+    ok = mgr.resolve_compact_mode(
+        enable=True,
+        total_bytes=compact_total,
+        page_size=compact_page,
+        group_payload_bytes=group_payload,
+    )
+    assert ok, "resolve_compact_mode must succeed on empty manager"
+    return mgr
+
+
+def test_compact_allocated_bytes_metric_registration():
+    """CPU_ALLOCATED_BYTES registered as OffloadingGaugeMetadata in spec."""
+    definitions = CPUOffloadingSpec.build_metric_definitions({})
+    meta = definitions[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES]
+    assert isinstance(meta, OffloadingGaugeMetadata)
+    assert "Exact bytes currently resident" in meta.documentation
+
+
+def test_compact_allocated_bytes_values():
+    """Empty=0, one store equals allocator.used_bytes and page-aligned,
+    reset returns to 0."""
+    mgr = _make_compact_manager()
+    alloc = mgr._compact_allocator
+
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES] == 0
+
+    key = make_offload_key(b"v", 0)
+    out = mgr.prepare_store([key], ReqContext("r", store_replay_unit=(key,)))
+    assert out is not None
+    mgr.complete_store([key], ReqContext("r"))
+
+    assert alloc.used_bytes == 4096
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES] == 4096
+
+    mgr.reset_cache()
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES] == 0
+
+
+def test_compact_allocated_bytes_replacement():
+    """Replacement eviction: pool stays at total, victim MISS, C HIT."""
+    mgr = _make_compact_manager(compact_total=8192, group_payload={0: 4096})
+    alloc = mgr._compact_allocator
+
+    a = make_offload_key(b"A", 0)
+    b = make_offload_key(b"B", 0)
+    for k, rid in [(a, "rA"), (b, "rB")]:
+        out = mgr.prepare_store([k], ReqContext(rid, store_replay_unit=(k,)))
+        assert out is not None
+        mgr.complete_store([k], ReqContext(rid))
+
+    assert alloc.used_bytes == 8192  # pool full (2 × 4096)
+
+    c = make_offload_key(b"C", 0)
+    out = mgr.prepare_store([c], ReqContext("rC", store_replay_unit=(c,)))
+    assert out is not None
+    assert len(out.evicted_keys) == 1
+    victim = out.evicted_keys[0]
+    mgr.complete_store([c], ReqContext("rC"))
+
+    assert mgr.lookup(victim, ReqContext("p")) is LookupResult.MISS
+    assert mgr.lookup(c, ReqContext("p")) is LookupResult.HIT
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES] == 8192
+    assert state[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES] == alloc.used_bytes
+
+
+def test_legacy_manager_allocated_bytes_zero():
+    """Non-compact (legacy) manager reports CPU_ALLOCATED_BYTES = 0."""
+    mgr = make_cpu_manager(num_blocks=4)
+    mgr.resolve_compact_mode(enable=False)
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_ALLOCATED_BYTES] == 0
+
+
+def test_compact_write_usage_pending_bytes():
+    """Compact mode write-usage uses pending bytes / total bytes.
+
+    A 12 KiB pending key in a 16 KiB pool reports 0.75 rather than the
+    block-count metric's 1.0 (or the buggy virtual-block ratio).  After
+    successful or failed complete_store, usage returns to 0.  Already-ready
+    keys are never decremented (no double-decrement on shared keys).
+    """
+    # 12 KiB payload in 16 KiB pool -> 0.75 write usage
+    mgr = _make_compact_manager(
+        compact_total=16384,
+        compact_page=16384,
+        group_payload={0: 12288},
+    )
+    alloc = mgr._compact_allocator
+    assert alloc.total_bytes == 16384
+
+    key = make_offload_key(b"k", 0)
+    out = mgr.prepare_store([key], ReqContext("r1", store_replay_unit=(key,)))
+    assert out is not None
+    assert mgr._compact_pending_store_bytes == 12288
+
+    # Write-usage is pending bytes / total bytes = 12288 / 16384 = 0.75.
+    # Total usage is page-aligned (16384 / 16384 = 1.0).
+    # No read-usage emission in compact mode (no byte-level active-load
+    # counter exists).
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC] == pytest.approx(0.75)
+    assert state[CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC] == pytest.approx(1.0)
+
+    # After successful complete_store, write usage drops to 0
+    mgr.complete_store([key], ReqContext("r1"))
+    assert mgr._compact_pending_store_bytes == 0
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC] == pytest.approx(0.0)
+
+    # Failure path also zeros write usage and pending bytes
+    key2 = make_offload_key(b"k2", 0)
+    out = mgr.prepare_store([key2], ReqContext("r2", store_replay_unit=(key2,)))
+    assert out is not None
+    assert mgr._compact_pending_store_bytes == 12288
+    mgr.complete_store([key2], ReqContext("r2"), success=False)
+    assert mgr._compact_pending_store_bytes == 0
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC] == pytest.approx(0.0)
+
+    # No double-decrement: calling complete_store on an already-ready key
+    # is a no-op (block.is_ready is True, skipped by the not is_ready guard).
+    # The counter must remain 0 after a no-op complete_store call.
+    out = mgr.prepare_store([key], ReqContext("r3", store_replay_unit=(key,)))
+    assert out is not None
+    assert mgr._compact_pending_store_bytes == 12288
+    mgr.complete_store([key], ReqContext("r3"))
+    assert mgr._compact_pending_store_bytes == 0
+
+    # Calling complete_store again with the same (now ready) key must not
+    # touch the counter — it's already at 0 and the block.is_ready check
+    # prevents any decrement on ready blocks.
+    mgr.complete_store([key], ReqContext("r3"))
+    assert mgr._compact_pending_store_bytes == 0
+
+    # reset_cache zeros the counter
+    mgr.reset_cache()
+    assert mgr._compact_pending_store_bytes == 0
+
+
+# --- CPU_FREE_BYTES / CPU_LARGEST_FREE_EXTENT_BYTES / CPU_FRAGMENTATION_RATIO ---
+
+
+def test_compact_free_bytes_metric_registration():
+    """CPU_FREE_BYTES, CPU_LARGEST_FREE_EXTENT_BYTES, CPU_FRAGMENTATION_RATIO
+    registered as OffloadingGaugeMetadata in spec."""
+    definitions = CPUOffloadingSpec.build_metric_definitions({})
+    meta_free = definitions[CPUOffloadingMetrics.CPU_FREE_BYTES]
+    assert isinstance(meta_free, OffloadingGaugeMetadata)
+    meta_extent = definitions[CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES]
+    assert isinstance(meta_extent, OffloadingGaugeMetadata)
+    meta_frag = definitions[CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO]
+    assert isinstance(meta_frag, OffloadingGaugeMetadata)
+
+
+def test_compact_free_bytes_values():
+    """Empty pool reports total free bytes, full pool reports 0,
+    reset returns to total."""
+    mgr = _make_compact_manager(compact_total=12288, compact_page=4096)
+    alloc = mgr._compact_allocator
+    total = alloc.total_bytes  # 12288
+
+    # Empty: free == total, largest == total, fragmentation == 0.0
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_FREE_BYTES] == total
+    assert state[CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES] == total
+    assert state[CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO] == 0.0
+
+    # One 4096 store: free = total - 4096
+    k1 = make_offload_key(b"k1", 0)
+    out = mgr.prepare_store([k1], ReqContext("r1", store_replay_unit=(k1,)))
+    assert out is not None
+    mgr.complete_store([k1], ReqContext("r1"))
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_FREE_BYTES] == total - 4096
+    assert state[CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES] == total - 4096
+    assert state[CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO] == 0.0
+
+    # Two more stores: pool full, free = 0, largest = 0
+    k2 = make_offload_key(b"k2", 0)
+    k3 = make_offload_key(b"k3", 0)
+    out = mgr.prepare_store([k2, k3], ReqContext("r2", store_replay_unit=(k2, k3)))
+    assert out is not None
+    mgr.complete_store([k2, k3], ReqContext("r2"))
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_FREE_BYTES] == 0
+    assert state[CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES] == 0
+    assert state[CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO] == 0.0
+
+    # Reset: back to total
+    mgr.reset_cache()
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.CPU_FREE_BYTES] == total
+    assert state[CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES] == total
+    assert state[CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO] == 0.0
+
+
+def test_legacy_free_bytes_not_emitted():
+    """Non-compact manager does not emit free/extent/frag."""
+    mgr = make_cpu_manager(num_blocks=4)
+    mgr.resolve_compact_mode(enable=False)
+    state = mgr.get_stats().reduce()
+    assert CPUOffloadingMetrics.CPU_FREE_BYTES not in state
+    assert CPUOffloadingMetrics.CPU_LARGEST_FREE_EXTENT_BYTES not in state
+    assert CPUOffloadingMetrics.CPU_FRAGMENTATION_RATIO not in state
+
+
+# --- Counter balance: _num_write_pending_blocks and _compact_pending_store_bytes ---
+
+
+def test_compact_counter_balance_success():
+    """Both pending counters return to zero after successful complete_store."""
+    mgr = _make_compact_manager(compact_total=12288, compact_page=4096)
+
+    k1 = make_offload_key(b"k1", 0)
+    out = mgr.prepare_store([k1], ReqContext("r1", store_replay_unit=(k1,)))
+    assert out is not None
+
+    # After prepare: both counters reflect the pending key
+    assert mgr._compact_pending_store_bytes == 4096
+    assert mgr._num_write_pending_blocks == 1
+
+    mgr.complete_store([k1], ReqContext("r1"))
+
+    # After success: both counters return to zero
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+
+def test_compact_counter_balance_failure():
+    """Both pending counters return to zero after failed complete_store."""
+    mgr = _make_compact_manager(compact_total=12288, compact_page=4096)
+
+    k1 = make_offload_key(b"k1", 0)
+    out = mgr.prepare_store([k1], ReqContext("r1", store_replay_unit=(k1,)))
+    assert out is not None
+
+    # After prepare: both counters reflect the pending key
+    assert mgr._compact_pending_store_bytes == 4096
+    assert mgr._num_write_pending_blocks == 1
+
+    mgr.complete_store([k1], ReqContext("r1"), success=False)
+
+    # After failure: both counters return to zero
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+
+def test_compact_counter_no_double_decrement_ready_key():
+    """Already-ready key does not cause double decrement of either counter."""
+    mgr = _make_compact_manager(compact_total=12288, compact_page=4096)
+
+    k1 = make_offload_key(b"k1", 0)
+
+    # Store and complete
+    out = mgr.prepare_store([k1], ReqContext("r1", store_replay_unit=(k1,)))
+    assert out is not None
+    mgr.complete_store([k1], ReqContext("r1"))
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+    # Calling complete_store again on the same (now ready) key must not
+    # touch either counter — block.is_ready guard prevents it.
+    mgr.complete_store([k1], ReqContext("r1"))
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+
+def test_compact_counter_balance_reset():
+    """reset_cache zeros both pending counters."""
+    mgr = _make_compact_manager(compact_total=12288, compact_page=4096)
+
+    k1 = make_offload_key(b"k1", 0)
+    out = mgr.prepare_store([k1], ReqContext("r1", store_replay_unit=(k1,)))
+    assert out is not None
+    assert mgr._compact_pending_store_bytes == 4096
+    assert mgr._num_write_pending_blocks == 1
+
+    mgr.reset_cache()
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+
+def test_compact_counter_balance_multi_key():
+    """Multiple keys: both counters decrement once per key on success/failure."""
+    mgr = _make_compact_manager(compact_total=24576, compact_page=4096)
+
+    k1 = make_offload_key(b"k1", 0)
+    k2 = make_offload_key(b"k2", 0)
+    k3 = make_offload_key(b"k3", 0)
+
+    out = mgr.prepare_store(
+        [k1, k2, k3], ReqContext("r1", store_replay_unit=(k1, k2, k3))
+    )
+    assert out is not None
+    assert mgr._compact_pending_store_bytes == 3 * 4096
+    assert mgr._num_write_pending_blocks == 3
+
+    # Success path: both return to zero
+    mgr.complete_store([k1, k2, k3], ReqContext("r1"))
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+    # Failure path: use fresh keys (k4, k5, k6) not previously stored
+    k4 = make_offload_key(b"k4", 0)
+    k5 = make_offload_key(b"k5", 0)
+    k6 = make_offload_key(b"k6", 0)
+    out = mgr.prepare_store(
+        [k4, k5, k6], ReqContext("r2", store_replay_unit=(k4, k5, k6))
+    )
+    assert out is not None
+    assert mgr._compact_pending_store_bytes == 3 * 4096
+    assert mgr._num_write_pending_blocks == 3
+
+    mgr.complete_store([k4, k5, k6], ReqContext("r2"), success=False)
+    assert mgr._compact_pending_store_bytes == 0
+    assert mgr._num_write_pending_blocks == 0
+
+
+# --- Threshold all-skipped: STORES_SKIPPED counter ---
+
+
+def test_compact_threshold_all_skipped():
+    """Compact prepare_store with threshold=2: all-skipped returns empty,
+    get_stats reports one skipped.  Transaction failure does not increment."""
+    mgr = _make_compact_manager(store_threshold=2, compact_total=12288)
+
+    # Keys must have at least 2 lookups to pass the threshold.
+    k1 = make_offload_key(b"k1", 0)
+    k2 = make_offload_key(b"k2", 0)
+
+    # First lookup (count=1): not eligible
+    assert mgr.lookup(k1, _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert mgr.lookup(k2, _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    # prepare_store with threshold=2: both keys still have count=1,
+    # skipped_count=2, keys_to_store=[], early path commits skipped count.
+    out = mgr.prepare_store([k1, k2], _EMPTY_REQ_CTX)
+    assert out is not None
+    assert out.keys_to_store == []
+
+    # get_stats reports 2 skipped
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.STORES_SKIPPED] == 2
+    # Second call resets to 0 (consumed batch counter)
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.STORES_SKIPPED] == 0
+
+
+def test_compact_threshold_transaction_failure_no_skipped(monkeypatch):
+    """Transaction failure must not increment STORES_SKIPPED.
+
+    Inject an atomic_replace failure (RuntimeError) after the skipped count
+    is computed but before commit.  STORES_SKIPPED must remain 0.
+    """
+    mgr = _make_compact_manager(store_threshold=2, compact_total=12288)
+
+    k1 = make_offload_key(b"k1", 0)
+    k2 = make_offload_key(b"k2", 0)
+    k3 = make_offload_key(b"k3", 0)
+
+    # Make k2, k3 eligible (2 lookups each); k1 stays at count=1.
+    for _ in range(2):
+        assert mgr.lookup(k2, _EMPTY_REQ_CTX) is LookupResult.MISS
+        assert mgr.lookup(k3, _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert mgr.lookup(k1, _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    # Fill the pool so k2/k3 need eviction.
+    out = mgr.prepare_store([k2], ReqContext("r2", store_replay_unit=(k2,)))
+    assert out is not None
+    mgr.complete_store([k2], ReqContext("r2"))
+
+    # Inject failure in atomic_replace before commit.
+
+    def fail_replace(*args, **kwargs):
+        raise RuntimeError("injected transaction failure")
+
+    monkeypatch.setattr(mgr._compact_allocator, "atomic_replace", fail_replace)
+
+    # Prepare_store([k1, k2, k3]):
+    #   - k1: count=1 -> filtered (skipped)
+    #   - k2: count>=2, already stored -> filtered from keys_to_store
+    #   - k3: count>=2, not stored -> keys_to_store = [k3]
+    #   - skipped_count=1 (k1 filtered)
+    #   - bytes_needed > 0 -> eviction needed
+    #   - atomic_replace raises RuntimeError -> failure before commit
+    # skipped_count must NOT be committed.
+    with pytest.raises(RuntimeError, match="injected transaction failure"):
+        mgr.prepare_store([k1, k2, k3], _EMPTY_REQ_CTX)
+
+    state = mgr.get_stats().reduce()
+    assert state[CPUOffloadingMetrics.STORES_SKIPPED] == 0

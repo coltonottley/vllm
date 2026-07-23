@@ -262,6 +262,8 @@ def _layer_mapping(
         # Rank 0 writes, all ranks load identity.
         if ctx.cp_size != 1:
             return None
+        if spec.kv_quant_mode.is_per_token_head:
+            return None
         if spec.num_kv_heads != 1 or ctx.total_kv_heads != 1:
             return None
         if not isinstance(kv_cache, torch.Tensor):

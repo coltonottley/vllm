@@ -351,13 +351,13 @@ class OffloadingManager(ABC):
         key_sizes: dict[int, int] | None = None,
         preferred_groups: tuple[int, ...] | None = None,
     ) -> None:
-        """Enable compact mode (fail-closed default).
+        """Enable compact mode (fail-loud default).
 
         Compact mode replaces the legacy fixed-block pool with a byte-level
         allocator.  Must be called while the manager is still empty.
 
-        The default implementation logs and returns without enabling compact
-        mode.  Managers that support compact override this method.
+        The default implementation raises NotImplementedError.  Managers
+        that support compact override this method.
 
         Args:
             total_bytes: Total CPU byte budget for compact allocations.
@@ -368,10 +368,12 @@ class OffloadingManager(ABC):
             preferred_groups: Ordered tuple of group indices preferred for
                               compact activation.  When present, the manager
                               activates only the listed groups.
+
+        Raises:
+            NotImplementedError: Compact mode is not supported by this
+                manager.
         """
-        logger.debug(
-            "enable_compact not supported by this manager (default fail-closed)"
-        )
+        raise NotImplementedError("compact mode is not supported by this manager")
 
     def get_stats(self) -> "OffloadingConnectorStats | None":
         """Return collected metrics since last call, or None if disabled."""

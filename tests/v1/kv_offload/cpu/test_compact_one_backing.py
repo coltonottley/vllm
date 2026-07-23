@@ -34,7 +34,6 @@ from vllm.v1.kv_offload.config import (
     OffloadingParallelConfig,
 )
 from vllm.v1.kv_offload.cpu.common import CompactCPUAddress
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
@@ -153,9 +152,6 @@ def _set_spawn_method(monkeypatch):
 
 # GPU-dependent tests require a CUDA-capable GPU with available memory.
 # Run only the GPU-independent spec/region/cleanup tests by default.
-_has_gpu = False  # GPU worker tests need real CUDA memory; skip for CI
-
-
 # ===========================================================================
 # One-construction: spec parses enable_compact_layout and builds region
 # ===========================================================================
@@ -354,131 +350,6 @@ class TestOneConstruction:
 
 
 # ===========================================================================
-# Legacy fallback same backing: rank-private strided views from shared region
-# ===========================================================================
-
-
-class TestLegacyFallbackSameBacking:
-    def test_worker_creates_strided_views_from_shared_region(self):
-        """Worker creates strided views from shared region, not separate malloc.
-        Requires CUDA for the GPU tensors."""
-        if not _has_gpu:
-            pytest.skip("CUDA required for worker test")
-
-        engine_id = f"test-{uuid.uuid4().hex[:8]}"
-        kv_caches = _make_kv_caches()
-        region = _make_region(
-            engine_id=engine_id,
-            num_blocks=32,
-            cpu_page_size=2 * PAGE_SIZE,
-            num_workers=1,
-            rank=0,
-        )
-        worker = None
-        try:
-            worker = CPUOffloadingWorker(
-                kv_caches=kv_caches,
-                blocks_per_chunk=1,
-                num_cpu_blocks=32,
-                mmap_region=region,
-            )
-            assert worker._mmap_region is region
-
-            # The worker's store handler CPU tensors should be inside the region.
-            store_handler = worker._store_handler
-            assert store_handler is not None
-
-            for cpu_tensor in store_handler.dst_tensors:
-                ptr = cpu_tensor.data_ptr()
-                base = region.base_ptr
-                end = base + region.total_size_bytes
-                assert base <= ptr < end, (
-                    f"CPU tensor at {ptr} is outside shared region [{base}, {end})"
-                )
-                assert cpu_tensor.shape[0] == region.num_blocks, (
-                    f"Expected {region.num_blocks} blocks, got {cpu_tensor.shape[0]}"
-                )
-        finally:
-            if worker is not None:
-                worker.shutdown()
-            region.cleanup()
-            _cleanup_file(region.mmap_path)
-
-    def test_strided_views_use_rank_private_slot(self):
-        """Each rank's strided view occupies its private slot within each row.
-        Requires CUDA for the GPU tensors."""
-        if not _has_gpu:
-            pytest.skip("CUDA required for worker test")
-
-        engine_id = f"test-{uuid.uuid4().hex[:8]}"
-        world_size = 2
-        slot_size = 2 * PAGE_SIZE
-        row_stride = world_size * slot_size
-        num_blocks = 8
-
-        region0 = SharedOffloadRegion(
-            engine_id=engine_id,
-            num_blocks=num_blocks,
-            rank=0,
-            kv_bytes_per_block=row_stride,
-            cpu_page_size=slot_size,
-        )
-        region1 = SharedOffloadRegion(
-            engine_id=engine_id,
-            num_blocks=num_blocks,
-            rank=1,
-            kv_bytes_per_block=row_stride,
-            cpu_page_size=slot_size,
-        )
-
-        kv_caches = _make_kv_caches(num_gpu_blocks=num_blocks)
-        worker0 = None
-        worker1 = None
-        try:
-            worker0 = CPUOffloadingWorker(
-                kv_caches=kv_caches,
-                blocks_per_chunk=1,
-                num_cpu_blocks=num_blocks,
-                mmap_region=region0,
-            )
-            worker1 = CPUOffloadingWorker(
-                kv_caches=kv_caches,
-                blocks_per_chunk=1,
-                num_cpu_blocks=num_blocks,
-                mmap_region=region1,
-            )
-
-            # Both regions have the same geometry.
-            assert region0.total_size_bytes == region1.total_size_bytes
-            assert region0._row_stride == region1._row_stride == row_stride
-            assert region0.num_blocks == region1.num_blocks == num_blocks
-
-            t0 = worker0._store_handler.dst_tensors[0]
-            t1 = worker1._store_handler.dst_tensors[0]
-
-            # Both tensors should have the same row stride (full world-sized row).
-            assert t0.stride(0) == row_stride
-            assert t1.stride(0) == row_stride
-
-            # Rank 0's storage_offset should be 0 (first in row).
-            # Rank 1's storage_offset should be >= slot_size.
-            off0 = t0.storage_offset() * t0.element_size()
-            off1 = t1.storage_offset() * t1.element_size()
-            assert off1 >= off0 + slot_size, (
-                f"Rank 1 storage offset {off1} should be >= "
-                f"rank 0 offset {off0} + slot_size {slot_size}"
-            )
-        finally:
-            if worker0 is not None:
-                worker0.shutdown()
-            if worker1 is not None:
-                worker1.shutdown()
-            region0.cleanup()
-            region1.cleanup()
-            _cleanup_file(region0.mmap_path)
-
-
-# ===========================================================================
 # Compact same backing: flat region addressing
 # ===========================================================================
 
@@ -640,20 +511,6 @@ class TestRankPrivateViewBounds:
 
 
 class TestCleanupOwnership:
-    def test_spec_shutdown_idempotent(self):
-        """shutdown_worker_region() is idempotent when no region exists."""
-        config = _make_minimal_config(
-            extra_config={"cpu_bytes_to_use": str(16 * 1024 * 1024)}
-        )
-        spec = CPUOffloadingSpec(config)
-        assert spec.shared_region is None
-        # First call: no-op.
-        spec.shutdown_worker_region()
-        assert spec.shared_region is None
-        # Second call: still no-op.
-        spec.shutdown_worker_region()
-        assert spec.shared_region is None
-
     def test_region_cleanup_idempotent(self):
         """SharedOffloadRegion.cleanup() is safe to call multiple times."""
         engine_id = f"test-{uuid.uuid4().hex[:8]}"

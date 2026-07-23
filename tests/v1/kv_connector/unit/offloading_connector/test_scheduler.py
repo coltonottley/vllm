@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
+    get_offload_group_idx,
     make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -3170,3 +3171,95 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     # Verify fence is empty after full lifecycle (cleanup happened).
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
     assert len(runner.connector_scheduler._jobs) == 0
+
+
+def test_latest_prompt_tail_offload(request_runner, monkeypatch):
+    # Force CPU platform before VllmConfig creation (dirty worktree fallback).
+    import vllm.platforms
+    import vllm.platforms.cpu  # noqa: F401
+
+    monkeypatch.setattr(
+        vllm.platforms, "_current_platform", vllm.platforms.cpu.CpuPlatform()
+    )
+
+    block_size = 4
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=12, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer2"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+            is_eagle_group=True,
+        ),
+    ]
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=1000,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+    runner.connector_scheduler.config = runner.connector_scheduler.config._replace(
+        offload_latest_prompt_tail_only=True,
+    )
+    runner.offloading_spec.offload_latest_prompt_tail_only = True
+    runner.scheduler.max_num_scheduled_tokens = 12  # 1 FA chunk per step
+    runner.new_request(token_ids=[0] * 48)  # 48 tokens = 4 FA / 12 SWA+EAGLE chunks
+
+    stored_counts = []
+    next_stored_list = []
+    replay_units = []
+
+    for _ in range(4):
+        cap = []
+        runner.manager.prepare_store.side_effect = lambda keys, ctx, c=cap: (
+            (c.append((list(keys), tuple(ctx.store_replay_unit))))
+            or generate_store_output(keys)
+        )
+        runner._run(decoded_tokens=[], complete_transfers=True)
+
+        keys, ru = cap[0]
+        g0 = sum(1 for k in keys if get_offload_group_idx(k) == 0)
+        g1 = sum(1 for k in keys if get_offload_group_idx(k) == 1)
+        g2 = sum(1 for k in keys if get_offload_group_idx(k) == 2)
+        stored_counts.append((g0, g1, g2))
+        replay_units.append(ru)
+
+        gs = runner.connector_scheduler._req_status[str(runner.req_id)].group_states
+        next_stored_list.append(tuple(g.next_stored_chunk_idx for g in gs))
+
+        # store_replay_unit cleared after prepare_store returns (finally block).
+        assert (
+            runner.connector_scheduler._req_status[
+                str(runner.req_id)
+            ].req_context.store_replay_unit
+            == ()
+        )
+
+    assert stored_counts == [(1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 2, 3)]
+    assert next_stored_list == [(1, 3, 3), (2, 6, 6), (3, 9, 9), (4, 12, 12)]
+
+    final_ru = replay_units[3]
+    grp0 = sum(1 for k in final_ru if get_offload_group_idx(k) == 0)
+    grp1 = sum(1 for k in final_ru if get_offload_group_idx(k) == 1)
+    grp2 = sum(1 for k in final_ru if get_offload_group_idx(k) == 2)
+    assert (grp0, grp1, grp2) == (4, 2, 3)
