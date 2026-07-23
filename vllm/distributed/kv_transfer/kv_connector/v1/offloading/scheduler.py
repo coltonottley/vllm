@@ -53,6 +53,7 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.common import CompactRankEvidence
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -139,6 +140,49 @@ def is_store_reachable_swa_chunk(
     return position_in_segment >= actual_segment_length - reachable_tail
 
 
+def latest_prompt_group_boundary(
+    *,
+    raw_prompt_boundary: int,
+    full_attention_alignment_tokens: int,
+    tokens_per_chunk: int,
+    is_eagle_group: bool,
+) -> int:
+    """Align a final latest-head tail to the replayable full-attention prefix.
+
+    EAGLE lookup verifies one volatile chunk immediately after that prefix,
+    then pops it. Preserve that one-chunk lookahead without shifting the
+    ordinary SWA/state tails.
+    """
+    aligned = round_down(raw_prompt_boundary, full_attention_alignment_tokens)
+    if is_eagle_group:
+        aligned = min(raw_prompt_boundary, aligned + tokens_per_chunk)
+    return aligned
+
+
+def latest_prompt_store_range(
+    *,
+    next_stored_block_idx: int,
+    storable_block_count: int,
+    sliding_window_blocks: int | None,
+    is_eagle_group: bool,
+    enabled: bool,
+    prompt_final: bool,
+) -> tuple[int, int]:
+    """Return the chunk range admitted in latest-head mode.
+
+    Full-attention groups and disabled mode preserve the ordinary incremental
+    range. Non-full groups retain a rolling candidate floor during intermediate
+    chunks, then admit exactly one globally final reachable tail.
+    """
+    if not enabled or sliding_window_blocks is None:
+        return next_stored_block_idx, storable_block_count
+    reachable_tail = sliding_window_blocks + int(is_eagle_group)
+    tail_start = max(0, storable_block_count - reachable_tail)
+    if not prompt_final:
+        return storable_block_count, tail_start
+    return max(next_stored_block_idx, tail_start), storable_block_count
+
+
 def resolve_mamba_align_size(
     spec: "OffloadingSpec", kv_cache_config: KVCacheConfig
 ) -> int | None:
@@ -164,6 +208,8 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    offload_latest_prompt_tail_only: bool = False
+    full_attention_alignment_tokens: int | None = None
 
     @classmethod
     def from_spec(
@@ -255,6 +301,10 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
+            offload_latest_prompt_tail_only=getattr(
+                spec, "offload_latest_prompt_tail_only", False
+            ),
+            full_attention_alignment_tokens=alignment_tokens,
         )
 
 
@@ -363,16 +413,32 @@ class RequestOffloadState:
         )
         return min(num_chunks, num_allocated_chunks)
 
-    def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
+    def advance_stored_idx(
+        self,
+        num_offloadable_tokens: int,
+        *,
+        latest_prompt_tail_only: bool = False,
+        prompt_final: bool = False,
+    ) -> None:
         # max(): at the prefill->decode transition of a chunk-aligned prompt,
         # storable_chunks drops by one (the eagle exclusion kicks in), and the
         # index must not move backwards past already-stored chunks.
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            num_chunks = self.storable_chunks(
+                group_config, group_state, num_offloadable_tokens
+            )
+            _, next_stored_chunk_idx = latest_prompt_store_range(
+                next_stored_block_idx=group_state.next_stored_chunk_idx,
+                storable_block_count=num_chunks,
+                sliding_window_blocks=(group_config.sliding_window_size_in_chunks),
+                is_eagle_group=group_config.is_eagle_group,
+                enabled=latest_prompt_tail_only,
+                prompt_final=prompt_final,
+            )
             group_state.next_stored_chunk_idx = max(
-                group_state.next_stored_chunk_idx,
-                self.storable_chunks(group_config, group_state, num_offloadable_tokens),
+                group_state.next_stored_chunk_idx, next_stored_chunk_idx
             )
 
     def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
@@ -454,7 +520,18 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(
             spec, vllm_config, kv_cache_config
         )
+
+        # Derive preferred eviction groups from group specs (e.g. EAGLE
+        # and all-SWA groups) if not explicitly configured.  Must run
+        # before get_manager() so the manager receives the correct set.
+        if hasattr(spec, "maybe_derive_compact_preferred_eviction_groups"):
+            spec.maybe_derive_compact_preferred_eviction_groups(kv_cache_config)
+        self._compact_preferred_groups: tuple[int, ...] = tuple(
+            getattr(spec, "compact_preferred_eviction_groups", ())
+        )
+
         self.manager: OffloadingManager = spec.get_manager()
+        self._vllm_config: VllmConfig = vllm_config
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -506,6 +583,20 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+        # Compact geometry rank consensus state.
+        # When compact is not requested, zero report/gate/activation.
+        self._compact_requested: bool = spec.compact_layout_requested
+        self._compact_expected_ranks: int = vllm_config.parallel_config.world_size
+        # Bitmask of ranks that have reported (bit i = rank i).
+        self._compact_report_rank_mask: int = 0
+        # Per-rank evidence preserved independently for comparison.
+        # Keyed by rank; on duplicate the first arrival is baseline.
+        self._compact_reports: dict[int, CompactRankEvidence] = {}
+        # First rank's evidence used as consistency baseline.
+        self._compact_baseline: CompactRankEvidence | None = None
+        self._compact_resolved: bool = False
+        self._compact_writer_ranks: set[int] = set()
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1026,6 +1117,11 @@ class OffloadingConnectorScheduler:
     ) -> dict[int, TransferJob]:
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
+
+        # Compact mode gating: suppress stores until consensus resolves.
+        if self._compact_requested and not self._compact_resolved:
+            logger.debug("Stores blocked: compact mode not yet resolved")
+            return store_jobs
         for req_id in chain(
             scheduler_output.num_scheduled_tokens,
             scheduler_output.finished_req_ids or (),
@@ -1047,20 +1143,59 @@ class OffloadingConnectorScheduler:
                 req_status, num_tokens_after_batch
             )
 
+            # Determine whether this step is the final prefill step (prompt
+            # boundary reached). Only relevant when latest-prompt-tail-only
+            # is active; ordinary mode stores all eligible chunks.
+            eligible_prompt_end = req.num_prompt_tokens
+            max_offload_tokens = req_status.max_offload_tokens
+            if max_offload_tokens is not None:
+                eligible_prompt_end = min(eligible_prompt_end, max_offload_tokens)
+            prompt_final = (
+                eligible_prompt_end > 0
+                and num_offloadable_tokens >= eligible_prompt_end
+            )
+            latest_prompt_tail_only = self.config.offload_latest_prompt_tail_only
+
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            replay_unit_keys: list[OffloadKey] = []
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                group_offloadable_tokens = num_offloadable_tokens
+                if (
+                    latest_prompt_tail_only
+                    and prompt_final
+                    and group_config.sliding_window_size_in_chunks is not None
+                    and self.config.full_attention_alignment_tokens is not None
+                ):
+                    group_offloadable_tokens = latest_prompt_group_boundary(
+                        raw_prompt_boundary=num_offloadable_tokens,
+                        full_attention_alignment_tokens=(
+                            self.config.full_attention_alignment_tokens
+                        ),
+                        tokens_per_chunk=group_config.tokens_per_chunk,
+                        is_eagle_group=group_config.is_eagle_group,
+                    )
                 num_chunks = req_status.storable_chunks(
-                    group_config, group_state, num_offloadable_tokens
+                    group_config, group_state, group_offloadable_tokens
                 )
 
-                start_chunk_idx = group_state.next_stored_chunk_idx
+                start_chunk_idx, next_stored_chunk_idx = latest_prompt_store_range(
+                    next_stored_block_idx=(group_state.next_stored_chunk_idx),
+                    storable_block_count=num_chunks,
+                    sliding_window_blocks=(group_config.sliding_window_size_in_chunks),
+                    is_eagle_group=group_config.is_eagle_group,
+                    enabled=latest_prompt_tail_only,
+                    prompt_final=prompt_final,
+                )
                 if num_chunks <= start_chunk_idx:
                     continue
                 offload_keys = group_state.offload_keys[start_chunk_idx:num_chunks]
+                if group_config.sliding_window_size_in_chunks is None:
+                    # Full attention requires the complete ordered prefix.
+                    replay_unit_keys.extend(group_state.offload_keys[:num_chunks])
                 # For each chunk, take the last corresponding GPU block. For
                 # blocks_per_chunk=3 and GPU block IDs 1 5 6 7 2 4 9 3 8,
                 # this selects GPU blocks 6 4 8.
@@ -1093,14 +1228,27 @@ class OffloadingConnectorScheduler:
                     ):
                         continue
                     new_offload_keys.append(offload_key)
+                    if group_config.sliding_window_size_in_chunks is not None:
+                        replay_unit_keys.append(offload_key)
 
             if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                req_status.advance_stored_idx(
+                    num_offloadable_tokens,
+                    latest_prompt_tail_only=self.config.offload_latest_prompt_tail_only,
+                    prompt_final=prompt_final,
+                )
+                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
-            store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
+            req_status.req_context.store_replay_unit = tuple(
+                dict.fromkeys(replay_unit_keys)
             )
+            try:
+                store_output = self.manager.prepare_store(
+                    new_offload_keys, req_status.req_context
+                )
+            finally:
+                req_status.req_context.store_replay_unit = ()
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1109,7 +1257,12 @@ class OffloadingConnectorScheduler:
                 continue
 
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                req_status.advance_stored_idx(
+                    num_offloadable_tokens,
+                    latest_prompt_tail_only=self.config.offload_latest_prompt_tail_only,
+                    prompt_final=prompt_final,
+                )
+                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             self._touch(req_status)
@@ -1319,6 +1472,26 @@ class OffloadingConnectorScheduler:
                     )
             self._connector_stats.aggregate(transfer_stats)
 
+        # --- Compact geometry consensus ---
+        # The first nonempty aggregated batch is the sole opportunity.
+        # All-rank executor aggregation means all worker reports arrive
+        # together in a single batch.  If the mask is still incomplete
+        # after processing the batch, the missing ranks are permanent.
+        if not self._compact_resolved and meta.compact_reports:
+            self._process_compact_geometry_report(meta)
+            if not self._compact_resolved and self._compact_requested:
+                # Batch processed but mask incomplete — immediate legacy.
+                missing = (
+                    self._compact_expected_ranks
+                    - self._compact_report_rank_mask.bit_count()
+                )
+                logger.warning(
+                    "Compact consensus: missing evidence from %d rank(s) "
+                    "in aggregated batch — resolving to legacy",
+                    missing,
+                )
+                self._resolve_compact_fail()
+
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
@@ -1356,6 +1529,251 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
+
+    def _process_compact_geometry_report(self, meta: OffloadingWorkerMetadata) -> None:
+        """Process incoming compact rank evidence for consensus.
+
+        Iterates per-rank reports from ``meta.compact_reports`` (list of
+        (rank, evidence) tuples preserving duplicates through transport).
+        Validates consistency against the first rank's baseline.  Missing,
+        duplicate, unexpected, unavailable, or conflicting evidence
+        permanently releases gated stores to legacy mode.
+
+        Must be called before ``aggregate()`` so each per-rank report is
+        processed with full provenance.
+        """
+        assert meta.compact_reports
+        assert self._compact_expected_ranks > 0
+
+        all_expected = (1 << self._compact_expected_ranks) - 1
+
+        for rank, evidence in meta.compact_reports:
+            rank_bit = 1 << rank
+
+            # ---- validate rank bounds ----
+            if rank_bit & ~all_expected:
+                logger.warning(
+                    "Compact evidence from unexpected rank %d "
+                    "(expected 0..%d) — rejecting",
+                    rank,
+                    self._compact_expected_ranks - 1,
+                )
+                return self._resolve_compact_fail()
+
+            # ---- no duplicate rank ----
+            if rank_bit & self._compact_report_rank_mask:
+                logger.warning(
+                    "Duplicate compact evidence from rank %d — rejecting",
+                    rank,
+                )
+                return self._resolve_compact_fail()
+
+            # ---- preserve independently ----
+            self._compact_reports[rank] = evidence
+
+            # ---- validate evidence present ----
+            if evidence is None:
+                logger.warning("Rank %d compact evidence is None — rejecting", rank)
+                return self._resolve_compact_fail()
+
+            # ---- validate unavailable/unresolved group -> legacy ----
+            if not all(evidence.group_available):
+                unavailable_idx = next(
+                    i for i, a in enumerate(evidence.group_available) if not a
+                )
+                logger.warning(
+                    "Compact group %d not available at rank %d "
+                    "(unsupported) — resolving to legacy",
+                    unavailable_idx,
+                    rank,
+                )
+                return self._resolve_compact_fail()
+
+            # ---- validate is_writer distribution: exactly one writer ----
+            if evidence.is_writer:
+                self._compact_writer_ranks.add(rank)
+                if len(self._compact_writer_ranks) > 1:
+                    logger.warning(
+                        "Compact multiple writers detected: ranks=%s — rejecting",
+                        sorted(self._compact_writer_ranks),
+                    )
+                    return self._resolve_compact_fail()
+
+            # ---- validate scalar fields match baseline ----
+            if self._compact_baseline is None:
+                self._compact_baseline = evidence
+            else:
+                baseline = self._compact_baseline
+                # Compare all scalar fields deterministically.
+                if evidence.group_available != baseline.group_available:
+                    logger.warning(
+                        "Compact group_available mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.group_available,
+                        baseline.group_available,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.canonical_bytes != baseline.canonical_bytes:
+                    logger.warning(
+                        "Compact canonical_bytes mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.canonical_bytes,
+                        baseline.canonical_bytes,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.page_size != baseline.page_size:
+                    logger.warning(
+                        "Compact page_size mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.page_size,
+                        baseline.page_size,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.cpu_bytes_to_use != baseline.cpu_bytes_to_use:
+                    logger.warning(
+                        "Compact cpu_bytes_to_use mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.cpu_bytes_to_use,
+                        baseline.cpu_bytes_to_use,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.parallel_invariant != baseline.parallel_invariant:
+                    logger.warning(
+                        "Compact parallel_invariant mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.parallel_invariant,
+                        baseline.parallel_invariant,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.expected_world_size != baseline.expected_world_size:
+                    logger.warning(
+                        "Compact expected_world_size mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.expected_world_size,
+                        baseline.expected_world_size,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.schema_version != baseline.schema_version:
+                    logger.warning(
+                        "Compact schema_version mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.schema_version,
+                        baseline.schema_version,
+                    )
+                    return self._resolve_compact_fail()
+                if evidence.world_size != baseline.world_size:
+                    logger.warning(
+                        "Compact world_size mismatch at rank %d: "
+                        "%s != baseline %s — rejecting",
+                        rank,
+                        evidence.world_size,
+                        baseline.world_size,
+                    )
+                    return self._resolve_compact_fail()
+
+            # ---- accumulate ----
+            self._compact_report_rank_mask |= rank_bit
+
+        # ---- validate exactly one writer across all reported ranks ----
+        # ---- check completion ----
+        if self._compact_report_rank_mask == all_expected:
+            if len(self._compact_writer_ranks) != 1:
+                logger.warning(
+                    "Compact consensus requires exactly one writer; got ranks=%s",
+                    sorted(self._compact_writer_ranks),
+                )
+                return self._resolve_compact_fail()
+            self._resolve_compact_pass()
+        else:
+            logger.info(
+                "Compact evidence: collected rank mask 0x%x, "
+                "expecting 0x%x (%d/%d ranks)",
+                self._compact_report_rank_mask,
+                all_expected,
+                self._compact_report_rank_mask.bit_count(),
+                self._compact_expected_ranks,
+            )
+
+    def _resolve_compact_fail(self) -> None:
+        """Permanently fall back to legacy mode (fail-closed).
+
+        Legacy mode means ``enable_compact`` is never called on the
+        manager.  The connector permanently uses the legacy block-ID path,
+        and subsequent stores flow through the existing block allocator.
+        The consensus decision is recorded and no further attempts are made.
+        """
+        if self._compact_resolved:
+            return
+        self._compact_resolved = True
+        logger.warning("Compact consensus FAILED — falling back to legacy mode")
+
+    def _resolve_compact_pass(self) -> None:
+        """Permanently activate compact mode (consensus reached).
+
+        Calls ``manager.enable_compact()`` with parameters derived from
+        agreed scalar evidence (total bytes, page size, per-group payload
+        bytes, and preferred groups from the final K API's evidence).
+        The compact store path is wired subsequently; this pass only
+        records the one-shot mode selection.
+
+        Evidence must carry ordered positive per-group compact payload
+        bytes sufficient for manager activation.
+        """
+        if self._compact_resolved:
+            return
+        self._compact_resolved = True
+
+        # Use the baseline evidence (first reporting rank) for geometry.
+        assert self._compact_baseline is not None
+        baseline = self._compact_baseline
+
+        logger.info(
+            "Compact consensus reached for %d ranks — enabling compact mode",
+            self._compact_expected_ranks,
+        )
+
+        # Derive total_bytes from agreed scalar evidence (cpu_bytes_to_use).
+        total_bytes = baseline.cpu_bytes_to_use
+        if total_bytes <= 0:
+            logger.error(
+                "Compact consensus: cpu_bytes_to_use=%d is not positive — "
+                "cannot enable compact mode",
+                total_bytes,
+            )
+            return
+
+        # Derive page_size from baseline evidence (agreed across ranks).
+        page_size = baseline.page_size
+        if page_size <= 0:
+            logger.error(
+                "Compact consensus: page_size=%d is not positive — "
+                "cannot enable compact mode",
+                page_size,
+            )
+            return
+
+        # Build per-group payload bytes map from ordered canonical_bytes.
+        # All available groups have positive canonical_bytes (validated
+        # above).  group_idx maps position in the ordered tuple.
+        group_payload_bytes: dict[int, int] = {
+            idx: int(cb) for idx, cb in enumerate(baseline.canonical_bytes)
+        }
+
+        preferred_groups = self._compact_preferred_groups
+
+        self.manager.enable_compact(
+            total_bytes=total_bytes,
+            page_size=page_size,
+            key_sizes=group_payload_bytes,
+            preferred_groups=preferred_groups,
+        )
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
