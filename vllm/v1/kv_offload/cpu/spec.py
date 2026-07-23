@@ -5,8 +5,15 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     OffloadingCounterMetadata,
@@ -22,6 +29,8 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+logger = init_logger(__name__)
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -123,15 +132,55 @@ class CPUOffloadingSpec(OffloadingSpec):
             "cache_policy_module_path"
         )
 
+        raw_compact = self.extra_config.get("enable_compact_layout")
+        self._compact_layout_requested = (
+            _parse_enable_compact_layout(raw_compact)
+            if raw_compact is not None
+            else False
+        )
+        self._compact_page_size = int(self.extra_config.get("compact_page_size", 65536))
+        if self._compact_page_size <= 0:
+            raise ValueError("compact_page_size must be positive")
+        self._compact_cpu_bytes = int(cpu_bytes_to_use)
+        if (
+            self._compact_layout_requested
+            and self._compact_cpu_bytes < self._compact_page_size
+        ):
+            raise ValueError("compact CPU budget is too small for one compact page")
+        self._compact_preferred_eviction_groups: set[int] = set(
+            self.extra_config.get("compact_preferred_eviction_groups", [])
+        )
+        self.offload_latest_prompt_tail_only = bool(
+            self.extra_config.get("offload_latest_prompt_tail_only", False)
+        )
+        self._worker_shared_region: SharedOffloadRegion | None = None
+
+    # --- Preferred eviction group derivation ---
+
+    def maybe_derive_compact_preferred_eviction_groups(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Derive preferred eviction groups from KVCacheConfig metadata.
+
+        A group is preferred if it has a sliding window (SWA) or is an
+        EAGLE group.  If ``compact_preferred_eviction_groups`` was already
+        set explicitly in config, it is preserved unchanged.
+        """
+        if self._compact_preferred_eviction_groups:
+            return
+
+        derived: set[int] = set()
+        for group in kv_cache_config.kv_cache_groups:
+            if _is_preferred_eviction_group(group):
+                derived.add(group.group_idx)
+        self._compact_preferred_eviction_groups = derived
+
+    # --- Manager construction ---
+
     @override
     def get_manager(self) -> OffloadingManager:
         if not self._manager:
-            # store_threshold: how many times a block must appear in lookup()
-            # before it is eligible for CPU offloading.  Values < 2 disable
-            # filtering (a threshold of 1 equals no filter; 0 is the default).
             store_threshold = int(self.extra_config.get("store_threshold", 0))
-
-            # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
             self._manager = CPUOffloadingManager(
@@ -144,24 +193,61 @@ class CPUOffloadingSpec(OffloadingSpec):
             )
         return self._manager
 
-    def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
-        mmap_region: SharedOffloadRegion | None = None
-        # num_blocks == 0 would size the region to zero bytes, which cannot be
-        # mmap'd; fall back to the tensor path (empty tensors) as before.
-        if current_platform.is_cuda_alike() and self.num_blocks > 0:
-            # Back each worker's CPU buffer with a private slot in a single
-            # shared mmap region instead of a per-rank pinned tensor. Fold the
-            # global physical device index into this replica's
-            # [0, world_size) slot range.
-            world_size = self.config.parallel.world_size
-            rank = torch.accelerator.current_device_index() % world_size
-            mmap_region = SharedOffloadRegion(
-                engine_id=self.config.engine_id,
-                num_blocks=self.num_blocks,
-                rank=rank,
-                kv_bytes_per_block=self.kv_bytes_per_chunk,
-                cpu_page_size=self.cpu_page_size_per_worker,
-            )
+    @property
+    def compact_layout_requested(self) -> bool:
+        return self._compact_layout_requested
+
+    @property
+    def enable_compact_layout(self) -> bool:
+        return self._compact_layout_requested
+
+    @property
+    def shared_region(self) -> SharedOffloadRegion | None:
+        return self._worker_shared_region
+
+    @property
+    def compact_preferred_eviction_groups(self) -> tuple[int, ...]:
+        return tuple(sorted(self._compact_preferred_eviction_groups))
+
+    @property
+    def compact_storage_budget_bytes(self) -> int | None:
+        if not self._compact_layout_requested:
+            return None
+        if self._worker_shared_region is not None:
+            return self._worker_shared_region.total_size_bytes
+        return (
+            self._compact_cpu_bytes // self.kv_bytes_per_chunk
+        ) * self.kv_bytes_per_chunk
+
+    @property
+    def compact_page_size(self) -> int:
+        return self._compact_page_size
+
+    @property
+    def compact_total_pages(self) -> int:
+        budget = self.compact_storage_budget_bytes
+        return 0 if budget is None else budget // self._compact_page_size
+
+    def _build_compact_shared_region(self) -> SharedOffloadRegion:
+        world_size = self.config.parallel.world_size
+        rank = self.config.parallel.rank
+        row_stride = self.cpu_page_size_per_worker * world_size
+        if row_stride <= 0 or self._compact_cpu_bytes < row_stride:
+            raise RuntimeError("compact CPU budget cannot fit one shared row")
+        num_rows = self._compact_cpu_bytes // row_stride
+        return SharedOffloadRegion(
+            engine_id=self.config.engine_id,
+            num_blocks=num_rows,
+            rank=rank,
+            kv_bytes_per_block=row_stride,
+            cpu_page_size=self.cpu_page_size_per_worker,
+        )
+
+    def create_worker(
+        self,
+        kv_caches: CanonicalKVCaches,
+        mmap_region: SharedOffloadRegion | None = None,
+    ) -> CPUOffloadingWorker:
         return CPUOffloadingWorker(
             kv_caches=kv_caches,
             blocks_per_chunk=self.blocks_per_chunk,
@@ -177,7 +263,35 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "CPU Offloading is currently only supported on CUDA-alike "
                     "and XPU GPUs"
                 )
-            self._worker = self.create_worker(kv_caches)
+            mmap_region = None
+            if self._compact_layout_requested:
+                mmap_region = self._build_compact_shared_region()
+                self._worker_shared_region = mmap_region
+            self._worker = self.create_worker(kv_caches, mmap_region=mmap_region)
 
         assert self._worker is not None
         return self._worker
+
+    def shutdown_worker_region(self) -> None:
+        if self._worker_shared_region is not None:
+            self._worker_shared_region.cleanup()
+            self._worker_shared_region = None
+
+
+def _is_preferred_eviction_group(group: KVCacheGroupSpec) -> bool:
+    """Return True if the group should be preferred for early eviction.
+
+    A group is preferred if it is an EAGLE group or if all its layers use
+    sliding window (SWA).
+    """
+    if group.is_eagle_group:
+        return True
+    gspec = group.kv_cache_spec
+    if isinstance(gspec, SlidingWindowSpec):
+        return True
+    if isinstance(gspec, UniformTypeKVCacheSpecs):
+        # All sub-specs must be SlidingWindowSpec.
+        return all(
+            isinstance(s, SlidingWindowSpec) for s in gspec.kv_cache_specs.values()
+        )
+    return False
