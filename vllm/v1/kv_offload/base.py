@@ -49,6 +49,11 @@ def get_offload_group_idx(key: OffloadKey) -> int:
 class ReqContext:
     req_id: str
     kv_transfer_params: dict[str, Any] | None = None
+    # Scheduler-owned, call-scoped replay unit for prepare_store. This is the
+    # complete set of CPU keys required to replay the request across all KV
+    # groups. Managers may copy it synchronously but must not retain the
+    # mutable container itself.
+    store_replay_unit: tuple[OffloadKey, ...] = ()
 
 
 class LookupResult(Enum):
@@ -339,6 +344,35 @@ class OffloadingManager(ABC):
         """Evict all tracked blocks and reset internal state."""
         return
 
+    def enable_compact(
+        self,
+        total_bytes: int,
+        page_size: int = 65536,
+        key_sizes: dict[int, int] | None = None,
+        preferred_groups: tuple[int, ...] | None = None,
+    ) -> None:
+        """Enable compact mode (fail-closed default).
+
+        Compact mode replaces the legacy fixed-block pool with a byte-level
+        allocator.  Must be called while the manager is still empty.
+
+        The default implementation logs and returns without enabling compact
+        mode.  Managers that support compact override this method.
+
+        Args:
+            total_bytes: Total CPU byte budget for compact allocations.
+            page_size: Base page size for compact addressing.
+            key_sizes: Optional per-group payload byte sizes (group_idx ->
+                       available payload bytes).  When present, the manager
+                       may use per-group sizing for activation.
+            preferred_groups: Ordered tuple of group indices preferred for
+                              compact activation.  When present, the manager
+                              activates only the listed groups.
+        """
+        logger.debug(
+            "enable_compact not supported by this manager (default fail-closed)"
+        )
+
     def get_stats(self) -> "OffloadingConnectorStats | None":
         """Return collected metrics since last call, or None if disabled."""
         return None
@@ -551,6 +585,16 @@ class OffloadingSpec(ABC):
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
+
+    @property
+    def compact_layout_requested(self) -> bool:
+        """Whether enable_compact_layout was requested (default False).
+
+        Override in subclass to read and validate the config key.  The
+        default returns False (legacy mode) for specs that do not support
+        compact layout.
+        """
+        return False
 
     @abstractmethod
     def get_manager(self) -> OffloadingManager:
