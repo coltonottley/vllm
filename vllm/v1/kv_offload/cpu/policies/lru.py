@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from typing_extensions import override
 
@@ -51,6 +51,44 @@ class LRUCachePolicy(CachePolicy):
     def clear(self) -> None:
         self.evictable_blocks.clear()
         self.blocks.clear()
+
+    @property
+    @override
+    def is_empty(self) -> bool:
+        return len(self.blocks) == 0
+
+    @override
+    def select_evict_until(
+        self,
+        can_fit: "Callable[[list[tuple[OffloadKey, BlockStatus]]], bool]",
+        protected: set[OffloadKey],
+        prefer_evict: "Callable[[OffloadKey], bool] | None" = None,
+    ) -> list[tuple[OffloadKey, BlockStatus]] | None:
+        candidates: list[tuple[OffloadKey, BlockStatus]] = []
+        already_selected: set[OffloadKey] = set()
+
+        def _gather(pred: "Callable[[OffloadKey], bool] | None") -> bool:
+            for key, _ in self.evictable_blocks.items():
+                if key in protected:
+                    continue
+                if pred is not None and not pred(key):
+                    continue
+                if key in already_selected:
+                    continue
+                block = self.blocks[key]
+                assert block.ref_cnt == 0
+                candidates.append((key, block))
+                already_selected.add(key)
+                if can_fit(candidates):
+                    return True
+            return False
+
+        # Preferred groups first, then normal groups.
+        if prefer_evict is not None and _gather(prefer_evict):
+            return candidates
+        if _gather(None):
+            return candidates
+        return None
 
     @override
     def evict(

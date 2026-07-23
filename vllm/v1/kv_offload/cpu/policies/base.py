@@ -89,6 +89,34 @@ class CachePolicy(ABC):
         Ghost lists and adaptive state are also reset.
         """
 
+    @property
+    @abstractmethod
+    def is_empty(self) -> bool:
+        """True when no blocks are tracked in the policy data structures.
+
+        Used by the manager to verify a safe empty-into-empty policy
+        replacement during late compact activation.
+        """
+
+    @abstractmethod
+    def select_evict_until(
+        self,
+        can_fit: "EvictUntilPredicate",
+        protected: set[OffloadKey],
+        prefer_evict: "PreferEvictFn | None" = None,
+    ) -> list[tuple[OffloadKey, BlockStatus]] | None:
+        """Non-mutating candidate selection.
+
+        Accumulates candidates until ``can_fit(candidates)`` returns True.
+        Candidates are returned as list of (key, block) tuples; state is
+        NOT mutated — the caller must call evict() or remove() after a
+        successful allocator transaction.
+
+        ``prefer_evict`` is an optional function (OffloadKey) -> bool
+        selecting preferred groups; preferred candidates are offered first,
+        then normal candidates, each partition in oldest-first (LRU) order.
+        """
+
     def mark_evictable(self, key: OffloadKey) -> None:
         """Called when a block's ref_cnt transitions to 0."""
         return
@@ -96,3 +124,7 @@ class CachePolicy(ABC):
     def mark_non_evictable(self, key: OffloadKey) -> None:
         """Called when a block's ref_cnt transitions from 0."""
         return
+
+
+EvictUntilPredicate = "Callable[[list[tuple[OffloadKey, BlockStatus]]], bool]"
+PreferEvictFn = "Callable[[OffloadKey], bool]"
