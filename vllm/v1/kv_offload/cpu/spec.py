@@ -170,9 +170,9 @@ class CPUOffloadingSpec(OffloadingSpec):
             return
 
         derived: set[int] = set()
-        for group in kv_cache_config.kv_cache_groups:
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
             if _is_preferred_eviction_group(group):
-                derived.add(group.group_idx)
+                derived.add(group_idx)
         self._compact_preferred_eviction_groups = derived
 
     # --- Manager construction ---
@@ -183,9 +183,14 @@ class CPUOffloadingSpec(OffloadingSpec):
             store_threshold = int(self.extra_config.get("store_threshold", 0))
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
+            num_blocks = (
+                self._compact_num_rows
+                if self._compact_layout_requested
+                else self.num_blocks
+            )
             self._manager = CPUOffloadingManager(
-                num_blocks=self.num_blocks,
-                cache_policy=self.eviction_policy,
+                num_blocks=num_blocks,
+                cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                 cache_policy_module_path=self.cache_policy_module_path,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
@@ -215,9 +220,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             return None
         if self._worker_shared_region is not None:
             return self._worker_shared_region.total_size_bytes
-        return (
-            self._compact_cpu_bytes // self.kv_bytes_per_chunk
-        ) * self.kv_bytes_per_chunk
+        return self._compact_num_rows * self._compact_row_stride
 
     @property
     def compact_page_size(self) -> int:
@@ -228,13 +231,37 @@ class CPUOffloadingSpec(OffloadingSpec):
         budget = self.compact_storage_budget_bytes
         return 0 if budget is None else budget // self._compact_page_size
 
-    def _build_compact_shared_region(self) -> SharedOffloadRegion:
+    @property
+    def _compact_row_stride(self) -> int:
+        """Aligned row stride for the compact shared region.
+
+        The raw row (``cpu_page_size_per_worker * world_size``) may not
+        be page-aligned.  Align to ``SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT``
+        (``mmap.PAGESIZE``) so that ``SharedOffloadRegion.__init__`` asserts
+        ``kv_bytes_per_block % page_size == 0``.
+        """
         world_size = self.config.parallel.world_size
+        raw_row = self.cpu_page_size_per_worker * world_size
+        return round_up(raw_row, SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT)
+
+    @property
+    def _compact_num_rows(self) -> int:
+        """Number of rows in the compact shared region.
+
+        ``floor(compact_cpu_bytes / aligned_row_stride)``.  Returns 0
+        when the budget cannot fit one full row.
+        """
+        stride = self._compact_row_stride
+        if stride <= 0 or self._compact_cpu_bytes < stride:
+            return 0
+        return self._compact_cpu_bytes // stride
+
+    def _build_compact_shared_region(self) -> SharedOffloadRegion:
         rank = self.config.parallel.rank
-        row_stride = self.cpu_page_size_per_worker * world_size
-        if row_stride <= 0 or self._compact_cpu_bytes < row_stride:
+        row_stride = self._compact_row_stride
+        num_rows = self._compact_num_rows
+        if num_rows == 0:
             raise RuntimeError("compact CPU budget cannot fit one shared row")
-        num_rows = self._compact_cpu_bytes // row_stride
         return SharedOffloadRegion(
             engine_id=self.config.engine_id,
             num_blocks=num_rows,
@@ -248,10 +275,15 @@ class CPUOffloadingSpec(OffloadingSpec):
         kv_caches: CanonicalKVCaches,
         mmap_region: SharedOffloadRegion | None = None,
     ) -> CPUOffloadingWorker:
+        num_cpu_blocks = (
+            self._compact_num_rows
+            if self._compact_layout_requested
+            else self.num_blocks
+        )
         return CPUOffloadingWorker(
             kv_caches=kv_caches,
             blocks_per_chunk=self.blocks_per_chunk,
-            num_cpu_blocks=self.num_blocks,
+            num_cpu_blocks=num_cpu_blocks,
             mmap_region=mmap_region,
         )
 
