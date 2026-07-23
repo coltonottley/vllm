@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from vllm.config import DeviceConfig, ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     TransferJob,
@@ -120,6 +121,7 @@ def _make_worker(
     kv_cache_config: KVCacheConfig,
     replicated_layout: bool = False,
     rank: int = 0,
+    vllm_config: VllmConfig | None = None,
 ):
     """
     Create an OffloadingConnectorWorker with mocked dependencies.
@@ -127,6 +129,12 @@ def _make_worker(
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
         OffloadingConnectorWorker,
     )
+
+    if vllm_config is None:
+        vllm_config = VllmConfig(
+            device_config=DeviceConfig("cpu"),
+            parallel_config=ParallelConfig(pipeline_parallel_size=2),
+        )
 
     spec = MagicMock(spec=OffloadingSpec)
     spec.replicated_layout = replicated_layout
@@ -136,7 +144,7 @@ def _make_worker(
 
     worker = OffloadingConnectorWorker(
         spec=spec,
-        vllm_config=_single_rank_vllm_config(NUM_KV_HEADS),
+        vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
     )
     worker.worker = MagicMock()
@@ -303,7 +311,10 @@ def test_offloading_connector_worker_accepts_plugin_spec_default_layout():
 
     OffloadingConnectorWorker(
         spec=spec,
-        vllm_config=_single_rank_vllm_config(NUM_KV_HEADS),
+        vllm_config=VllmConfig(
+            device_config=DeviceConfig("cpu"),
+            parallel_config=ParallelConfig(pipeline_parallel_size=2),
+        ),
         kv_cache_config=KVCacheConfig(
             num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
         ),
