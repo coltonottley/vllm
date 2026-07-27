@@ -1196,7 +1196,19 @@ class OffloadingConnectorScheduler:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
-                logger.warning("Request %s: cannot store chunks", req_id)
+                logger.warning("Request %s: cannot store chunks; skipping", req_id)
+                # CPU offload is a best-effort cache. Retrying the same
+                # allocation on every decode step can put prepare_store() on
+                # the critical path indefinitely when the tier is full,
+                # reducing generation to the allocation-attempt cadence. Mark
+                # the currently eligible range handled so later steps can
+                # consider newly eligible chunks without replaying this failed
+                # range. A future request can still store the same content.
+                req_status.advance_stored_idx(
+                    num_offloadable_tokens,
+                    latest_prompt_tail_only=self.config.offload_latest_prompt_tail_only,
+                    prompt_final=prompt_final,
+                )
                 self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
