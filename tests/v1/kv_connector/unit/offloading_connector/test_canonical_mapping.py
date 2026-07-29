@@ -708,18 +708,51 @@ def test_receipt_basic_mla():
     assert receipt is not None
     assert receipt.certified
     assert not receipt.fallback
-    assert len(receipt.per_layer) == 1
+    assert receipt.layer_names == ("mla",)
     assert len(receipt.per_rank) == 2  # one per rank (tp=2)
     for rr in receipt.per_rank:
         assert 0 <= rr.rank < 2
-        assert rr.mapping.layer_name == "mla"
-        assert rr.mapping.num_writers == 2
+        assert rr.layer_name == "mla"
+        assert rr.num_writers == 2
     # Receipt is identical for the same config (deterministic)
     mappings2, receipt2 = derive_canonical_mappings_with_receipt(
         _receipt_config(tp=2), kv_cache_config, {}
     )
     assert receipt == receipt2
     assert hash(receipt) == hash(receipt2)
+
+
+def test_receipt_rank0_rank1_identical():
+    """Rank 0 and rank 1 produce identical receipts even though local
+    mappings differ (rotating writer_index).  Regression: per_layer was
+    previously populated from my_rank, making receipts unequal."""
+    spec = _mla_spec()
+    kv_cache_config = _kv_cache_config(
+        [KVCacheGroupSpec(layer_names=["mla"], kv_cache_spec=spec)]
+    )
+    # Rank 0 config
+    cfg0 = _receipt_config(tp=2)
+    cfg0.parallel_config.rank = 0
+    mappings0, receipt0 = derive_canonical_mappings_with_receipt(
+        cfg0, kv_cache_config, {}
+    )
+    # Rank 1 config (same except rank)
+    cfg1 = _receipt_config(tp=2)
+    cfg1.parallel_config.rank = 1
+    mappings1, receipt1 = derive_canonical_mappings_with_receipt(
+        cfg1, kv_cache_config, {}
+    )
+    # Local mappings differ by writer_index
+    assert mappings0["mla"].writer_index == 0
+    assert mappings1["mla"].writer_index == 1
+    assert mappings0["mla"] != mappings1["mla"]
+    # But receipts MUST be identical (role-neutral, both contain all ranks)
+    assert receipt0 == receipt1
+    assert hash(receipt0) == hash(receipt1)
+    # Each receipt has both ranks' data
+    assert len(receipt0.per_rank) == 2
+    rank_indices = sorted(rr.rank for rr in receipt0.per_rank)
+    assert rank_indices == [0, 1]
 
 
 def test_receipt_malformed_writer_indices_rejected():
@@ -729,8 +762,12 @@ def test_receipt_malformed_writer_indices_rejected():
     spec = _mla_spec(compress_ratio=4)  # compressed MLA
     cache = None
     ctx = lambda rank: _RankContext(
-        tp_size=2, dcp_size=1, pcp_size=1, interleave=1,
-        total_kv_heads=1, rank=rank,
+        tp_size=2,
+        dcp_size=1,
+        pcp_size=1,
+        interleave=1,
+        total_kv_heads=1,
+        rank=rank,
     )
     per_rank = [_layer_mapping(spec, cache, 3, ctx(r)) for r in range(2)]
     # Both mappings are valid identity mappings with num_writers=2

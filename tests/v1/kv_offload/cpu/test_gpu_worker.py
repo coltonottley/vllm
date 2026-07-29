@@ -668,7 +668,7 @@ def _make_compact_geometry(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_compact_nonwriter_zero_descriptors(mocker):
-    """Non-writer compact store (empty store_runs) produces zero descriptors
+    """Non-writer compact store (``is_writer()=False``) produces zero descriptors
     through the compact path.  swap_blocks_batch is NOT called but the
     completion gate still registers job_id."""
     gpu_row_stride = 1024

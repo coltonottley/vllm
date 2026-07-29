@@ -950,42 +950,30 @@ class TestCompactConsensusReceipt:
         )
         from vllm.v1.kv_offload.base import CopyRun
 
+        rr = CanonicalMappingReceipt.RankReceipt
+        cr = CopyRun
         receipt = CanonicalMappingReceipt(
-            per_layer=(
-                CanonicalMappingReceipt.LayerReceipt(
+            layer_names=("layer.0",),
+            per_rank=(
+                rr(
+                    rank=0,
                     layer_name="layer.0",
                     canonical_page_size_bytes=64,
                     local_page_size_bytes=64,
-                    runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                    runs=(cr(0, 0, 64, 1, 64, 64),),
                     num_writers=2,
                     writer_index=0,
                     parallelism_agnostic=True,
                 ),
-            ),
-            per_rank=(
-                CanonicalMappingReceipt.RankReceipt(
-                    rank=0,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=64,
-                        local_page_size_bytes=64,
-                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
-                        num_writers=2,
-                        writer_index=0,
-                        parallelism_agnostic=True,
-                    ),
-                ),
-                CanonicalMappingReceipt.RankReceipt(
+                rr(
                     rank=1,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=64,
-                        local_page_size_bytes=64,
-                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
-                        num_writers=2,
-                        writer_index=1,
-                        parallelism_agnostic=True,
-                    ),
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=64,
+                    local_page_size_bytes=64,
+                    runs=(cr(0, 0, 64, 1, 64, 64),),
+                    num_writers=2,
+                    writer_index=1,
+                    parallelism_agnostic=True,
                 ),
             ),
             fallback=False,
@@ -1009,71 +997,47 @@ class TestCompactConsensusReceipt:
         )
         from vllm.v1.kv_offload.base import CopyRun
 
+        rr = CanonicalMappingReceipt.RankReceipt
+        cr = CopyRun
         receipt = CanonicalMappingReceipt(
-            per_layer=(
-                CanonicalMappingReceipt.LayerReceipt(
+            layer_names=("layer.0",),
+            per_rank=(
+                rr(
+                    rank=0,
                     layer_name="layer.0",
                     canonical_page_size_bytes=64,
                     local_page_size_bytes=64,
-                    runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                    runs=(cr(0, 0, 64, 1, 64, 64),),
                     num_writers=1,
                     writer_index=0,
                     parallelism_agnostic=True,
-                ),
-            ),
-            per_rank=(
-                CanonicalMappingReceipt.RankReceipt(
-                    rank=0,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=64,
-                        local_page_size_bytes=64,
-                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
-                        num_writers=1,
-                        writer_index=0,
-                        parallelism_agnostic=True,
-                    ),
                 ),
             ),
             fallback=False,
             certified=True,
         )
         altered = CanonicalMappingReceipt(
-            per_layer=(
-                CanonicalMappingReceipt.LayerReceipt(
+            layer_names=("layer.0",),
+            per_rank=(
+                rr(
+                    rank=0,
                     layer_name="layer.0",
-                    canonical_page_size_bytes=128,  # DIFFERENT from baseline
+                    canonical_page_size_bytes=128,
                     local_page_size_bytes=128,
-                    runs=(CopyRun(0, 0, 128, 1, 128, 128),),
+                    runs=(cr(0, 0, 128, 1, 128, 128),),
                     num_writers=1,
                     writer_index=0,
                     parallelism_agnostic=True,
                 ),
-            ),
-            per_rank=(
-                CanonicalMappingReceipt.RankReceipt(
-                    rank=0,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=128,
-                        local_page_size_bytes=128,
-                        runs=(CopyRun(0, 0, 128, 1, 128, 128),),
-                        num_writers=1,
-                        writer_index=0,
-                        parallelism_agnostic=True,
-                    ),
-                ),
-                CanonicalMappingReceipt.RankReceipt(
+                rr(
                     rank=1,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=128,
-                        local_page_size_bytes=128,
-                        runs=(CopyRun(0, 0, 128, 1, 128, 128),),
-                        num_writers=1,
-                        writer_index=0,
-                        parallelism_agnostic=True,
-                    ),
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=128,
+                    local_page_size_bytes=128,
+                    runs=(cr(0, 0, 128, 1, 128, 128),),
+                    num_writers=1,
+                    writer_index=0,
+                    parallelism_agnostic=True,
                 ),
             ),
             fallback=False,
@@ -1097,42 +1061,30 @@ class TestCompactConsensusReceipt:
         )
         from vllm.v1.kv_offload.base import CopyRun
 
+        rr = CanonicalMappingReceipt.RankReceipt
+        cr = CopyRun
         opaque_receipt = CanonicalMappingReceipt(
-            per_layer=(
-                CanonicalMappingReceipt.LayerReceipt(
+            layer_names=("layer.0",),
+            per_rank=(
+                rr(
+                    rank=0,
                     layer_name="layer.0",
                     canonical_page_size_bytes=128,
                     local_page_size_bytes=64,
-                    runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                    runs=(cr(0, 0, 64, 1, 64, 64),),
                     num_writers=1,
                     writer_index=0,
                     parallelism_agnostic=False,
                 ),
-            ),
-            per_rank=(
-                CanonicalMappingReceipt.RankReceipt(
-                    rank=0,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=128,
-                        local_page_size_bytes=64,
-                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
-                        num_writers=1,
-                        writer_index=0,
-                        parallelism_agnostic=False,
-                    ),
-                ),
-                CanonicalMappingReceipt.RankReceipt(
+                rr(
                     rank=1,
-                    mapping=CanonicalMappingReceipt.LayerReceipt(
-                        layer_name="layer.0",
-                        canonical_page_size_bytes=128,
-                        local_page_size_bytes=64,
-                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
-                        num_writers=1,
-                        writer_index=0,
-                        parallelism_agnostic=False,
-                    ),
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=128,
+                    local_page_size_bytes=64,
+                    runs=(cr(0, 0, 64, 1, 64, 64),),
+                    num_writers=1,
+                    writer_index=0,
+                    parallelism_agnostic=False,
                 ),
             ),
             fallback=True,
@@ -1143,8 +1095,12 @@ class TestCompactConsensusReceipt:
         sched.manager = recorder
 
         # Opaque mapping fails via group_available=False
-        ev0 = _make_evidence(rank=0, group_available=(False,), canonical_bytes=(0,),
-                             receipt=opaque_receipt)
+        ev0 = _make_evidence(
+            rank=0,
+            group_available=(False,),
+            canonical_bytes=(0,),
+            receipt=opaque_receipt,
+        )
         sched._process_compact_geometry_report(_meta([(0, ev0)]))
         assert sched._compact_resolved
         assert not recorder.enable_compact_called

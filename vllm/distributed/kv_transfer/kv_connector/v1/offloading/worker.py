@@ -7,7 +7,6 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
-    derive_canonical_mappings,
     derive_canonical_mappings_with_receipt,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -104,9 +103,6 @@ class OffloadingConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
-        mappings = derive_canonical_mappings(
-            self.vllm_config, kv_cache_config, kv_caches
-        )
         mappings, receipt = derive_canonical_mappings_with_receipt(
             self.vllm_config, kv_cache_config, kv_caches
         )
