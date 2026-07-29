@@ -31,9 +31,9 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalPageMapping,
+    CopyRun,
     GPULoadStoreSpec,
     LoadStoreSpec,
-    MappedRun,
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
@@ -713,7 +713,7 @@ def _mock_vllm_config():
 
 
 def test_compact_geometry_types_and_one_shot():
-    run = MappedRun(0, 0, 64, 1, 64, 64)
+    run = CopyRun(0, 0, 64, 1, 64, 64)
     mapping = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
     with pytest.raises(ValueError, match="non-negative"):
         CompactLayerGeometry("l", mapping, 64, 64, -1, 0)
@@ -768,7 +768,7 @@ def _pk_views(config):
 
 
 def test_derive_compact_group_geometry_errors():
-    run = MappedRun(0, 0, 64, 1, 64, 64)
+    run = CopyRun(0, 0, 64, 1, 64, 64)
     m = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
     attn = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
@@ -858,7 +858,7 @@ def test_derive_compact_group_geometry_errors():
 
 def test_derive_compact_group_geometry_success():
     pk = _pk_spec()
-    run = MappedRun(0, 0, 64, 1, 64, 64)
+    run = CopyRun(0, 0, 64, 1, 64, 64)
     m = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
     c = _pk_cfg(pk, {0: ["pk.0"], 64: ["pk.1"]})
     g = derive_compact_group_geometry(
@@ -949,7 +949,7 @@ def test_register_kv_caches_compact_geometry():
             assert ly.local_page_size_bytes == spec.page_size_bytes
             assert ly.canonical_page_size_bytes == spec.page_size_bytes
             assert ly.canonical_offset == li * spec.page_size_bytes
-            assert ly.mapping.parallel_invariant
+            assert ly.mapping.parallelism_agnostic
 
 
 def test_register_kv_caches_plugin_no_geometry():

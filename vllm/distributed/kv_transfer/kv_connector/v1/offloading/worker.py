@@ -8,6 +8,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     derive_canonical_mappings,
+    derive_canonical_mappings_with_receipt,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
@@ -78,18 +79,18 @@ class OffloadingConnectorWorker:
     def _configure_compact_geometry_and_evidence(
         self,
         geometry: tuple,
+        receipt: object = None,
     ) -> None:
         assert isinstance(self.worker, CPUOffloadingWorker)
         self.worker.configure_compact_geometry(geometry)
         if not self.spec.compact_layout_requested:
             return
-        is_writer = any(
-            layer.mapping.store_runs
-            for group in geometry
-            if group is not None
-            for layer in group.layers
-        )
-        self._is_store_writer = is_writer
+        # In compact mode, do NOT overwrite coarse connector _is_store_writer.
+        # CPUOffloadingSpec SUPPORTS_REPLICATED_LAYOUT=False means ordinary
+        # initialization leaves _is_store_writer true so all ranks receive
+        # store jobs.  plan_compact_transfer filters each layer/block via
+        # mapping.is_writer(gpu_block_id).  Outside compact mode, ordinary
+        # #48906 replicated-layout coarse rank-0 behavior is preserved.
         self._compact_rank_evidence = CompactRankEvidence.from_geometry(
             rank=self.spec.config.parallel.rank,
             world_size=self.spec.config.parallel.world_size,
@@ -97,13 +98,16 @@ class OffloadingConnectorWorker:
             page_size=self.spec.compact_page_size,
             cpu_bytes_to_use=self.spec.compact_storage_budget_bytes,
             blocks_per_chunk=self.spec.blocks_per_chunk,
-            is_writer=is_writer,
+            receipt=receipt,
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
         mappings = derive_canonical_mappings(
+            self.vllm_config, kv_cache_config, kv_caches
+        )
+        mappings, receipt = derive_canonical_mappings_with_receipt(
             self.vllm_config, kv_cache_config, kv_caches
         )
 
@@ -210,7 +214,7 @@ class OffloadingConnectorWorker:
                 compact_geometry = derive_compact_group_geometry(
                     kv_cache_config, mappings, kv_caches, layer_is_packed
                 )
-                self._configure_compact_geometry_and_evidence(compact_geometry)
+                self._configure_compact_geometry_and_evidence(compact_geometry, receipt)
             return
 
         block_tensors: list[CanonicalKVCacheTensor] = []
@@ -284,7 +288,7 @@ class OffloadingConnectorWorker:
             compact_geometry = derive_compact_group_geometry(
                 kv_cache_config, mappings, kv_caches, layer_is_packed
             )
-            self._configure_compact_geometry_and_evidence(compact_geometry)
+            self._configure_compact_geometry_and_evidence(compact_geometry, receipt)
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]

@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping i
     _RankContext,
     _verify_tiling,
     derive_canonical_mappings,
+    derive_canonical_mappings_with_receipt,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -488,12 +489,12 @@ def test_compressed_mla_rank0_writer_tp_only():
     reader = _mapping(spec, None, _ctx(rank=1, tp=2))
     assert writer.canonical_page_size_bytes == 64
     assert writer.local_page_size_bytes == 64
-    assert _triples(writer.store_runs) == [(0, 0, 64)]
-    assert _triples(writer.load_runs) == [(0, 0, 64)]
-    assert reader.store_runs == ()
-    assert _triples(reader.load_runs) == [(0, 0, 64)]
-    assert writer.parallel_invariant
-    assert reader.parallel_invariant
+    assert _triples(writer.runs) == [(0, 0, 64)]
+    assert _triples(reader.runs) == [(0, 0, 64)]
+    assert writer.is_writer(0)  # rank 0 writes block 0
+    assert not reader.is_writer(0)  # rank 1 does not write block 0
+    assert writer.parallelism_agnostic
+    assert reader.parallelism_agnostic
 
 
 def test_compressed_mla_dsv4_ratio_128():
@@ -509,10 +510,11 @@ def test_compressed_mla_dsv4_ratio_128():
     writer = _mapping(spec, None, _ctx(rank=0, tp=4))
     reader = _mapping(spec, None, _ctx(rank=3, tp=4))
     assert writer.canonical_page_size_bytes == 1024
-    assert _triples(writer.store_runs) == [(0, 0, 1024)]
-    assert reader.store_runs == ()
-    assert reader.load_runs == writer.load_runs
-    assert writer.parallel_invariant
+    assert _triples(writer.runs) == [(0, 0, 1024)]
+    assert reader.runs == writer.runs
+    assert writer.is_writer(0)  # rank 0 writes block 0
+    assert not reader.is_writer(0)  # rank 3 does not write block 0
+    assert writer.parallelism_agnostic
 
 
 def test_compressed_mla_byte_roundtrip():
@@ -523,11 +525,12 @@ def test_compressed_mla_byte_roundtrip():
     ref = bytes((11 + 7 * i) % 256 for i in range(64))
     # rank 0 stores into canonical buffer
     buf = bytearray(64)
-    for local, canonical, n in _triples(rank0.store_runs):
-        buf[canonical : canonical + n] = ref[local : local + n]
+    for local, canonical, n in _triples(rank0.runs):
+        if rank0.is_writer(0):
+            buf[canonical : canonical + n] = ref[local : local + n]
     # rank 1 loads from canonical
     page = bytearray(rank1.local_page_size_bytes)
-    for local, canonical, n in _triples(rank1.load_runs):
+    for local, canonical, n in _triples(rank1.runs):
         page[local : local + n] = buf[canonical : canonical + n]
     assert bytes(page) == ref
 
@@ -569,10 +572,11 @@ def test_sliding_window_mla_identity():
     writer = _mapping(spec, cache, _ctx(rank=0, tp=2, total=1))
     reader = _mapping(spec, cache, _ctx(rank=1, tp=2, total=1))
     assert writer.canonical_page_size_bytes == 256
-    assert _triples(writer.store_runs) == [(0, 0, 256)]
-    assert reader.store_runs == ()
-    assert _triples(reader.load_runs) == [(0, 0, 256)]
-    assert writer.parallel_invariant
+    assert _triples(writer.runs) == [(0, 0, 256)]
+    assert _triples(reader.runs) == [(0, 0, 256)]
+    assert writer.is_writer(0)
+    assert not reader.is_writer(0)
+    assert writer.parallelism_agnostic
 
 
 def test_sliding_window_mla_dsv4_fp8():
@@ -606,8 +610,8 @@ def test_sliding_window_mla_dsv4_fp8():
     assert cache.stride()[0] == padded_stride
     mapping = _mapping(spec, cache, _ctx(rank=0, tp=2, total=1))
     assert mapping.canonical_page_size_bytes == page
-    assert _triples(mapping.store_runs) == [(0, 0, page)]
-    assert mapping.parallel_invariant
+    assert _triples(mapping.runs) == [(0, 0, page)]
+    assert mapping.parallelism_agnostic
 
 
 def test_sliding_window_mla_byte_roundtrip():
@@ -618,10 +622,11 @@ def test_sliding_window_mla_byte_roundtrip():
     rank1 = _mapping(spec, cache, _ctx(rank=1, tp=2, total=1))
     ref = bytes((13 + 5 * i) % 256 for i in range(256))
     buf = bytearray(256)
-    for local, canonical, n in _triples(rank0.store_runs):
-        buf[canonical : canonical + n] = ref[local : local + n]
+    for local, canonical, n in _triples(rank0.runs):
+        if rank0.is_writer(0):
+            buf[canonical : canonical + n] = ref[local : local + n]
     page = bytearray(rank1.local_page_size_bytes)
-    for local, canonical, n in _triples(rank1.load_runs):
+    for local, canonical, n in _triples(rank1.runs):
         page[local : local + n] = buf[canonical : canonical + n]
     assert bytes(page) == ref
 
@@ -669,5 +674,116 @@ def test_generic_attention_works_alongside_new_branches():
     # K + V regions, each 4 tokens x 2 heads x 128B = 1024B; 2 regions
     assert mapping.canonical_page_size_bytes == 2 * 1024
     # 8 fragments: 4 tokens x 2 regions, canonical stride=2x local stride
-    assert len(_triples(mapping.store_runs)) == 8
-    assert mapping.store_runs == mapping.load_runs
+    assert len(_triples(mapping.runs)) == 8
+    assert len(mapping.runs) > 0
+
+
+# ---------------------------------------------------------------------------
+# derive_canonical_mappings_with_receipt tests
+# ---------------------------------------------------------------------------
+
+
+def _receipt_config(tp=1, dcp=1, pcp=1, pp=1, interleave=1, total_kv_heads=2):
+    config = MagicMock()
+    config.parallel_config.tensor_parallel_size = tp
+    config.parallel_config.decode_context_parallel_size = dcp
+    config.parallel_config.prefill_context_parallel_size = pcp
+    config.parallel_config.cp_kv_cache_interleave_size = interleave
+    config.parallel_config.world_size = pp * tp * pcp
+    config.parallel_config.rank = 0
+    config.model_config.get_total_num_kv_heads.return_value = total_kv_heads
+    return config
+
+
+def test_receipt_basic_mla():
+    """Receipt is produced for valid MLA config and contains correct fields."""
+    spec = _mla_spec()
+    kv_cache_config = _kv_cache_config(
+        [KVCacheGroupSpec(layer_names=["mla"], kv_cache_spec=spec)]
+    )
+    mappings, receipt = derive_canonical_mappings_with_receipt(
+        _receipt_config(tp=2), kv_cache_config, {}
+    )
+    assert "mla" in mappings
+    assert receipt is not None
+    assert receipt.certified
+    assert not receipt.fallback
+    assert len(receipt.per_layer) == 1
+    assert len(receipt.per_rank) == 2  # one per rank (tp=2)
+    for rr in receipt.per_rank:
+        assert 0 <= rr.rank < 2
+        assert rr.mapping.layer_name == "mla"
+        assert rr.mapping.num_writers == 2
+    # Receipt is identical for the same config (deterministic)
+    mappings2, receipt2 = derive_canonical_mappings_with_receipt(
+        _receipt_config(tp=2), kv_cache_config, {}
+    )
+    assert receipt == receipt2
+    assert hash(receipt) == hash(receipt2)
+
+
+def test_receipt_malformed_writer_indices_rejected():
+    """_verify_tiling rejects duplicate or missing writer indices."""
+    # Build a set of mappings where one rank claims to be a writer
+    # for all blocks but the other doesn't — causes tiling failure.
+    spec = _mla_spec(compress_ratio=4)  # compressed MLA
+    cache = None
+    ctx = lambda rank: _RankContext(
+        tp_size=2, dcp_size=1, pcp_size=1, interleave=1,
+        total_kv_heads=1, rank=rank,
+    )
+    per_rank = [_layer_mapping(spec, cache, 3, ctx(r)) for r in range(2)]
+    # Both mappings are valid identity mappings with num_writers=2
+    assert all(m is not None for m in per_rank)
+    # This should pass _verify_tiling since both have correct rotating writers
+    _verify_tiling("test", per_rank)
+
+    # Manually create a broken mapping with duplicate writer claim
+    run = CopyRun(0, 0, 64, 1, 64, 64)
+    good = CanonicalPageMapping(64, 64, (run,), 2, 0, True)
+    duplicate = CanonicalPageMapping(
+        64, 64, (run,), 2, 0, True
+    )  # same writer_index as good!
+    # Two ranks both claim writer_index=0 with num_writers=2
+    # Block 0: both write (duplicate cover) — assertion fires here
+    with pytest.raises(AssertionError, match="do not tile"):
+        _verify_tiling("dup", [good, duplicate])
+
+
+def test_receipt_empty_when_no_layers():
+    """No certifiable layers returns None receipt."""
+    spec = MagicMock()  # Non-attention spec
+    kv_cache_config = _kv_cache_config(
+        [KVCacheGroupSpec(layer_names=["unknown"], kv_cache_spec=spec)]
+    )
+    mappings, receipt = derive_canonical_mappings_with_receipt(
+        _receipt_config(tp=2), kv_cache_config, {}
+    )
+    assert receipt is None
+
+
+def test_tp2_adjacent_block_rotation_tiles_once():
+    """TP2 adjacent block IDs elect rotating writers that each tile canonical
+    page exactly once."""
+    spec = _mla_spec()  # compress_ratio=1, tp=2
+    cache = None
+    ctx0 = _ctx(rank=0, tp=2)
+    ctx1 = _ctx(rank=1, tp=2)
+    m0 = _mapping(spec, cache, ctx0)
+    m1 = _mapping(spec, cache, ctx1)
+    # With tp=2, both ranks hold identical bytes, num_writers=2
+    assert m0.num_writers == 2
+    assert m1.num_writers == 2
+    assert m0.writer_index == 0
+    assert m1.writer_index == 1
+    # Adjacent block IDs rotate writer
+    assert m0.is_writer(0)  # rank 0 writes block 0
+    assert not m1.is_writer(0)  # rank 1 does NOT write block 0
+    assert not m0.is_writer(1)  # rank 0 does NOT write block 1
+    assert m1.is_writer(1)  # rank 1 writes block 1
+    assert m0.is_writer(2)  # rank 0 writes block 2
+    assert not m1.is_writer(2)
+    # Both retain complete runs (identical)
+    assert m0.runs == m1.runs
+    # _verify_tiling passes: block 0 tiled by rank0, block 1 by rank1
+    _verify_tiling("tp2-rotation", [m0, m1])

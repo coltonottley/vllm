@@ -30,6 +30,65 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class CanonicalMappingReceipt:
+    """Immutable all-rank validated receipt produced after _verify_tiling.
+
+    Deterministically identical on all workers given identical config/geometry.
+    Contains per-layer and per-rank ordered fields for cross-rank comparison.
+    Does not hash away evidence or duplicate _verify_tiling.
+
+    Fields
+    ------
+    per_layer:
+        One LayerReceipt per layer, in layer order.
+    fallback:
+        True if any layer uses opaque fallback (uncertified).
+    certified:
+        True if every layer is certified (no fallback).
+    """
+
+    @dataclass(frozen=True)
+    class LayerReceipt:
+        """Per-layer canonical mapping evidence for receipt."""
+
+        layer_name: str
+        canonical_page_size_bytes: int
+        local_page_size_bytes: int
+        runs: tuple[CopyRun, ...]
+        num_writers: int
+        writer_index: int
+        parallelism_agnostic: bool
+
+    @dataclass(frozen=True)
+    class RankReceipt:
+        """Per-rank per-layer mapping evidence for receipt."""
+
+        rank: int
+        mapping: "CanonicalMappingReceipt.LayerReceipt"
+
+    per_layer: tuple[LayerReceipt, ...]
+    per_rank: tuple[RankReceipt, ...]
+    fallback: bool
+    certified: bool
+
+
+def _build_mapping_receipt(
+    layer_name: str,
+    mapping: CanonicalPageMapping,
+) -> CanonicalMappingReceipt.LayerReceipt:
+    """Build a LayerReceipt from a single CanonicalPageMapping."""
+    return CanonicalMappingReceipt.LayerReceipt(
+        layer_name=layer_name,
+        canonical_page_size_bytes=mapping.canonical_page_size_bytes,
+        local_page_size_bytes=mapping.local_page_size_bytes,
+        runs=mapping.runs,
+        num_writers=mapping.num_writers,
+        writer_index=mapping.writer_index,
+        parallelism_agnostic=mapping.parallelism_agnostic,
+    )
+
+
+@dataclass(frozen=True)
 class _RankContext:
     """Sharding parameters of one worker rank within the offload group."""
 
@@ -327,8 +386,8 @@ def _layer_mapping(
             canonical_page_size_bytes=page,
             local_page_size_bytes=page,
             runs=(CopyRun(0, 0, page, 1, page, page),),
-            num_writers=1,
-            writer_index=0,
+            num_writers=ctx.tp_size,
+            writer_index=ctx.tp_rank,
             parallelism_agnostic=True,
         )
 
@@ -492,3 +551,90 @@ def derive_canonical_mappings(
             _verify_tiling(layer_name, per_rank)
             mappings[layer_name] = per_rank[my_rank]
     return mappings
+
+
+def derive_canonical_mappings_with_receipt(
+    vllm_config: "VllmConfig",
+    kv_cache_config: KVCacheConfig,
+    kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+) -> tuple[dict[str, CanonicalPageMapping], CanonicalMappingReceipt | None]:
+    """Like derive_canonical_mappings but also returns an all-rank validated
+    receipt when all layers are certifiable and tiling succeeds.
+
+    The receipt is produced only after _verify_tiling() succeeds for every
+    layer.  It is role-neutral (identical on all workers given identical
+    config/geometry) and suitable for cross-rank compact consensus comparison.
+    When any layer falls back to opaque mapping, the receipt carries
+    fallback=True and certified=False.
+    """
+    parallel_config = vllm_config.parallel_config
+    tp_size = parallel_config.tensor_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    group_size = tp_size * pcp_size
+    if parallel_config.world_size != group_size:
+        return ({}, None)
+
+    def ctx(rank: int) -> _RankContext:
+        return _RankContext(
+            tp_size=tp_size,
+            dcp_size=parallel_config.decode_context_parallel_size,
+            pcp_size=pcp_size,
+            interleave=parallel_config.cp_kv_cache_interleave_size,
+            total_kv_heads=vllm_config.model_config.get_total_num_kv_heads(),
+            rank=rank,
+        )
+
+    my_rank = parallel_config.rank
+    num_blocks = kv_cache_config.num_blocks
+    has_fallback = False
+
+    mappings: dict[str, CanonicalPageMapping] = {}
+    all_layer_receipts: list[CanonicalMappingReceipt.LayerReceipt] = []
+    all_rank_receipts: list[CanonicalMappingReceipt.RankReceipt] = []
+
+    for kv_cache_group in kv_cache_config.kv_cache_groups:
+        group_kv_cache_spec = kv_cache_group.kv_cache_spec
+        if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
+            per_layer_specs = group_kv_cache_spec.kv_cache_specs
+        else:
+            per_layer_specs = {}
+        for layer_name in kv_cache_group.layer_names:
+            spec = per_layer_specs.get(layer_name, group_kv_cache_spec)
+            per_rank: list[CanonicalPageMapping] = []
+            for rank in range(group_size):
+                mapping = _layer_mapping(
+                    spec, kv_caches.get(layer_name), num_blocks, ctx(rank)
+                )
+                if mapping is None:
+                    break
+                per_rank.append(mapping)
+            if len(per_rank) != group_size:
+                page = _unpadded_page_size(spec)
+                if page is None:
+                    continue
+                per_rank = [
+                    _opaque_fallback_mapping(page, group_size, rank)
+                    for rank in range(group_size)
+                ]
+                has_fallback = True
+            _verify_tiling(layer_name, per_rank)
+            mappings[layer_name] = per_rank[my_rank]
+
+            # Build receipt entries
+            layer_receipt = _build_mapping_receipt(layer_name, per_rank[my_rank])
+            all_layer_receipts.append(layer_receipt)
+            for rank in range(group_size):
+                rank_rec = _build_mapping_receipt(layer_name, per_rank[rank])
+                all_rank_receipts.append(
+                    CanonicalMappingReceipt.RankReceipt(rank=rank, mapping=rank_rec)
+                )
+
+    receipt = None
+    if all_layer_receipts:
+        receipt = CanonicalMappingReceipt(
+            per_layer=tuple(all_layer_receipts),
+            per_rank=tuple(all_rank_receipts),
+            fallback=has_fallback,
+            certified=not has_fallback,
+        )
+    return (mappings, receipt)

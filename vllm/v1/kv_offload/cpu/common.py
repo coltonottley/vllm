@@ -112,8 +112,9 @@ def _compute_geometry_signature(
     Returns a nested tuple of private immutable tuple type aliases
     preserving explicit group/layer/run boundaries.  Uses ``layer.mapping.runs``
     (the complete bidirectional runs tuple) so writer and nonwriter ranks
-    with identical GPU geometry produce the same signature.  Does NOT use ``hash()``, JSON,
-    process-randomized digest, or serialize ``CanonicalPageMapping`` objects.
+    with identical GPU geometry produce the same signature.  Does NOT use
+    ``hash()``, JSON, process-randomized digest, or serialize
+    ``CanonicalPageMapping`` objects.
     """
     result: list[_CompactGroup] = []
     for g in geometry:
@@ -163,6 +164,13 @@ class CompactRankEvidence:
     hashing them away.  Each rank's evidence is preserved independently
     so the scheduler can compare per-rank tuples for consistency.
 
+    The ``receipt`` field carries an immutable role-neutral all-rank
+    validated receipt (``CanonicalMappingReceipt``) produced only after
+    the canonical mapping ``_verify_tiling()`` succeeds.  The scheduler
+    compares receipt identity (equality of all fields) plus existing
+    group/scalar/world/rank/parallel invariants; it does not model
+    static writer roles or re-run tiling.
+
     Fields
     ------
     rank:
@@ -188,10 +196,6 @@ class CompactRankEvidence:
         True when every available group's mapping is parallel-invariant
         (the canonical bytes are identical under any parallel configuration
         with the same block span).
-    is_writer:
-        Writer-load role fact: True if this rank writes (offloads) KV
-        data.  All writer ranks must agree on the same geometry for
-        consensus to succeed.
     expected_world_size:
         The world_size this rank expects. Validated against parallel
         config for consistency.
@@ -201,24 +205,24 @@ class CompactRankEvidence:
         at construction.  Must be structurally valid when any group is
         available: a nonempty tuple of private immutable tuple type
         aliases with matching ``present`` and length.
-    role_mapping_valid:
-        True when the rank's store/load run mappings are consistent
-        with its writer/nonwriter role.  Valid writer: at least one
-        store run overall AND for every layer, runs present (certified).
+    receipt:
+        Immutable all-rank validated receipt from canonical mapping.
+        None when no canonical mapping could be produced (e.g. world
+        size mismatch).  When non-None, the scheduler compares receipts
+        among all ranks for cross-rank consensus.
     """
 
     rank: int
     world_size: int
-    schema_version: int = 2
+    schema_version: int = 3
     group_available: tuple[bool, ...] = ()
     canonical_bytes: tuple[int, ...] = ()
     page_size: int = 0
     cpu_bytes_to_use: int = 0
     parallel_invariant: bool = True
-    is_writer: bool = True
     expected_world_size: int = 0
     signature: tuple[_CompactGroup, ...] = ()
-    role_mapping_valid: bool = True
+    receipt: object = None
 
     def __post_init__(self) -> None:
         if len(self.group_available) != len(self.canonical_bytes):
@@ -306,7 +310,7 @@ class CompactRankEvidence:
         page_size: int,
         cpu_bytes_to_use: int,
         blocks_per_chunk: int = 1,
-        is_writer: bool | None = None,
+        receipt: object = None,
     ) -> "CompactRankEvidence":
         """Build evidence from a worker's CompactGroupGeometry tuple.
 
@@ -317,13 +321,14 @@ class CompactRankEvidence:
             page_size: Base page size for compact addressing.
             cpu_bytes_to_use: Total CPU byte budget.
             blocks_per_chunk: Native GPU blocks represented by one offload key.
-            is_writer: Optional override; if provided, must match the derived
-                role from geometry.  Default None means derived from geometry.
+            receipt: Optional all-rank validated receipt from canonical mapping.
+                When provided, carried verbatim in the evidence for cross-rank
+                scheduler comparison.
 
         Returns:
             A CompactRankEvidence with per-group availability,
-            canonical payload bytes, and the role-neutral geometry
-            signature preserved as scalar values.
+            canonical payload bytes, role-neutral geometry signature,
+            and optionally the validated receipt.
         """
         group_available = tuple(g is not None for g in geometry)
         if blocks_per_chunk <= 0:
@@ -336,38 +341,8 @@ class CompactRankEvidence:
             g is not None and g.parallel_invariant for g in geometry
         )
 
-        # Derive is_writer from geometry. With the current rotating-writer
-        # API (num_writers/writer_index), every certified mapping is a
-        # potential writer for some subset of blocks.  Non-certified groups
-        # produce no mappings.
-        derived_is_writer = any(group is not None for group in geometry)
-        if is_writer is not None:
-            assert is_writer == derived_is_writer, (
-                f"is_writer={is_writer} does not match derived "
-                f"is_writer={derived_is_writer} from geometry"
-            )
-        else:
-            is_writer = derived_is_writer
-
         # Compute role-neutral geometry signature.
         signature = _compute_geometry_signature(geometry)
-
-        # Compute role_mapping_valid from actual mappings.
-        # With the current rotating-writer API, every certified mapping
-        # uses the same runs for both directions.  A rank is valid if it
-        # either has certified mappings (writer for some blocks) or has
-        # no mappings at all (non-certified).  The old store_runs/load_runs
-        # separation does not exist.
-        runs_consistent = all(
-            True for group in geometry if group is not None for layer in group.layers
-        )
-        if derived_is_writer:
-            # Writer requires at least one store run (guaranteed by
-            # derived_is_writer) AND store == load for every layer.
-            role_mapping_valid = runs_consistent
-        else:
-            # Nonwriter: no certified mappings (no groups available).
-            role_mapping_valid = not any(group is not None for group in geometry)
 
         return CompactRankEvidence(
             rank=rank,
@@ -377,10 +352,9 @@ class CompactRankEvidence:
             page_size=page_size,
             cpu_bytes_to_use=cpu_bytes_to_use,
             parallel_invariant=parallel_invariant,
-            is_writer=is_writer,
             expected_world_size=world_size,
             signature=signature,
-            role_mapping_valid=role_mapping_valid,
+            receipt=receipt,
         )
 
 

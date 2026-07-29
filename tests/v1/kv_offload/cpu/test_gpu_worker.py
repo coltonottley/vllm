@@ -593,21 +593,22 @@ def test_worker_fallback_pinned_tensors():
 def _compact_identity_mapping(
     page_size: int,
     *,
-    store_runs: tuple | None = None,
+    num_writers: int = 1,
+    writer_index: int = 0,
 ):
     """Build an identity ``CanonicalPageMapping`` for compact test helpers.
     Single-fragment identity run covering the full page.
     """
-    from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+    from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
-    run = MappedRun(0, 0, page_size, 1, page_size, page_size)
-    s_runs = (run,) if store_runs is None else store_runs
+    run = CopyRun(0, 0, page_size, 1, page_size, page_size)
     return CanonicalPageMapping(
         canonical_page_size_bytes=page_size,
         local_page_size_bytes=page_size,
-        store_runs=s_runs,
-        load_runs=(run,),
-        parallel_invariant=True,
+        runs=(run,),
+        num_writers=num_writers,
+        writer_index=writer_index,
+        parallelism_agnostic=True,
     )
 
 
@@ -659,7 +660,7 @@ def _make_compact_geometry(
             gpu_row_stride=gpu_row_stride,
             local_extent=local_extent,
             canonical_extent=canonical_extent,
-            parallel_invariant=all(m.parallel_invariant for m in layer_mappings),
+            parallel_invariant=all(m.parallelism_agnostic for m in layer_mappings),
         ),
     )
 
@@ -674,7 +675,7 @@ def test_compact_nonwriter_zero_descriptors(mocker):
     local_page_size = 1024
     blocks_per_chunk = 1
 
-    m = _compact_identity_mapping(local_page_size, store_runs=())
+    m = _compact_identity_mapping(local_page_size, num_writers=2, writer_index=1)
     geometry = _make_compact_geometry(["l0"], [m], [0], gpu_row_stride)
 
     num_gpu_blocks = 8

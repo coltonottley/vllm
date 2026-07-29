@@ -596,7 +596,6 @@ class OffloadingConnectorScheduler:
         # First rank's evidence used as consistency baseline.
         self._compact_baseline: CompactRankEvidence | None = None
         self._compact_resolved: bool = False
-        self._compact_writer_ranks: set[int] = set()
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1587,23 +1586,14 @@ class OffloadingConnectorScheduler:
                 )
                 return self._resolve_compact_fail()
 
-            # ---- validate role_mapping_valid ----
-            if not evidence.role_mapping_valid:
-                logger.warning(
-                    "Compact evidence from rank %d has "
-                    "role_mapping_valid=False — resolving to legacy",
-                    rank,
-                )
-                return self._resolve_compact_fail()
-
             # ---- preserve independently ----
             self._compact_reports[rank] = evidence
 
             # ---- reject unsupported schema version ----
-            if evidence.schema_version != 2:
+            if evidence.schema_version != 3:
                 logger.warning(
                     "Compact evidence from rank %d has schema_version=%d "
-                    "(expected 2) — rejecting",
+                    "(expected 3) — rejecting",
                     rank,
                     evidence.schema_version,
                 )
@@ -1636,16 +1626,6 @@ class OffloadingConnectorScheduler:
                     rank,
                 )
                 return self._resolve_compact_fail()
-
-            # ---- validate is_writer distribution: exactly one writer ----
-            if evidence.is_writer:
-                self._compact_writer_ranks.add(rank)
-                if len(self._compact_writer_ranks) > 1:
-                    logger.warning(
-                        "Compact multiple writers detected: ranks=%s — rejecting",
-                        sorted(self._compact_writer_ranks),
-                    )
-                    return self._resolve_compact_fail()
 
             # ---- validate scalar fields match baseline ----
             if self._compact_baseline is None:
@@ -1726,6 +1706,15 @@ class OffloadingConnectorScheduler:
                     )
                     return self._resolve_compact_fail()
 
+                # ---- compare validated receipt ----
+                if evidence.receipt != baseline.receipt:
+                    logger.warning(
+                        "Compact receipt mismatch at rank %d: "
+                        "receipt differs from baseline — rejecting",
+                        rank,
+                    )
+                    return self._resolve_compact_fail()
+
                 # ---- compare role-neutral geometry signature ----
                 if evidence.signature != baseline.signature:
                     logger.warning(
@@ -1740,15 +1729,8 @@ class OffloadingConnectorScheduler:
             # ---- accumulate ----
             self._compact_report_rank_mask |= rank_bit
 
-        # ---- validate exactly one writer across all reported ranks ----
         # ---- check completion ----
         if self._compact_report_rank_mask == all_expected:
-            if len(self._compact_writer_ranks) != 1:
-                logger.warning(
-                    "Compact consensus requires exactly one writer; got ranks=%s",
-                    sorted(self._compact_writer_ranks),
-                )
-                return self._resolve_compact_fail()
             self._resolve_compact_pass()
         else:
             logger.info(

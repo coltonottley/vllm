@@ -70,13 +70,13 @@ def _make_evidence(
     page_size: int = 65536,
     cpu_bytes_to_use: int = 10**9,
     parallel_invariant: bool = True,
-    is_writer: bool = True,
     expected_world_size: int | None = None,
+    receipt: object = None,
 ) -> CompactRankEvidence:
     """Build a structurally valid CompactRankEvidence using private immutable
     tuple type aliases for signatures.
 
-    Callers testing role-mapping or signature rejection must use the raw
+    Callers testing signature rejection must use the raw
     constructor or ``from_geometry``.
     """
     from vllm.v1.kv_offload.cpu.common import _COMPACT_ABSENT_GROUP
@@ -97,10 +97,9 @@ def _make_evidence(
         page_size=page_size,
         cpu_bytes_to_use=cpu_bytes_to_use,
         parallel_invariant=parallel_invariant,
-        is_writer=is_writer,
         expected_world_size=expected_world_size or world_size,
         signature=tuple(sig_groups),
-        role_mapping_valid=True,
+        receipt=receipt,
     )
 
 
@@ -224,7 +223,6 @@ class TestCompactRankEvidence:
         assert ev.group_available == (True,)
         assert ev.canonical_bytes == (64,)
         assert ev.parallel_invariant is True
-        assert ev.is_writer is True
         assert ev.expected_world_size == 2
 
         chunked = CompactRankEvidence.from_geometry(
@@ -354,13 +352,12 @@ class TestCompactRankEvidence:
                 cpu_bytes_to_use=10**9,
                 expected_world_size=2,
                 signature=(),
-                role_mapping_valid=True,
             )
 
-    def test_validation_schema_version_default_two(self):
-        """Default schema_version is 2."""
+    def test_validation_schema_version_default_three(self):
+        """Default schema_version is 3."""
         ev = _make_evidence()
-        assert ev.schema_version == 2
+        assert ev.schema_version == 3
 
 
 # ===================================================================
@@ -538,7 +535,7 @@ class TestCompactConsensus:
     def test_consensus_once_only(self, sample_evidence):
         """Already resolved — subsequent reports do not re-activate."""
         sched = _make_scheduler(world_size=2)
-        ev1 = _make_evidence(rank=1, canonical_bytes=(64,), is_writer=False)
+        ev1 = _make_evidence(rank=1, canonical_bytes=(64,))
         sched._process_compact_geometry_report(_meta([(0, sample_evidence)]))
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
@@ -566,7 +563,7 @@ class TestCompactConsensus:
         sched.manager = recorder
 
         ev0 = _make_evidence(rank=0, canonical_bytes=(64,))
-        ev1 = _make_evidence(rank=1, canonical_bytes=(64,), is_writer=False)
+        ev1 = _make_evidence(rank=1, canonical_bytes=(64,))
         sched._process_compact_geometry_report(_meta([(0, ev0)]))
         assert not sched._compact_resolved
 
@@ -721,7 +718,7 @@ class TestCompactConsensus:
         assert not recorder.enable_compact_called
 
     def test_invalid_geometry_signature_fails(self):
-        """Mismatched geometry signatures produce role_mapping_valid=False."""
+        """Mismatched geometry signatures rejection."""
         from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
         sched = _make_scheduler(world_size=2)
@@ -753,8 +750,6 @@ class TestCompactConsensus:
             page_size=65536,
             cpu_bytes_to_use=10**9,
         )
-        assert ev.is_writer
-        assert ev.role_mapping_valid  # valid by construction
 
         # Collect two incompatible geometry signatures: different gpu_row_stride
         run2 = CopyRun(0, 0, 32, 1, 32, 32)
@@ -784,8 +779,8 @@ class TestCompactConsensus:
         )
         sched._process_compact_geometry_report(_meta([(0, ev)]))
         sched._process_compact_geometry_report(_meta([(1, ev2)]))
-        # Should not resolve compact due to incompatible signatures
-        assert not sched._compact_resolved
+        # Should reject compact due to incompatible signatures; resolved to legacy.
+        assert sched._compact_resolved
         assert not recorder.enable_compact_called
 
     def test_valid_writer_pair_activates(self):
@@ -833,8 +828,6 @@ class TestCompactConsensus:
             page_size=65536,
             cpu_bytes_to_use=10**9,
         )
-        assert ev0.is_writer
-        assert ev1.is_writer  # both ranks are writers in the rotating-writer model
 
         sched._process_compact_geometry_report(_meta([(0, ev0)]))
         assert not sched._compact_resolved
@@ -843,7 +836,7 @@ class TestCompactConsensus:
         assert recorder.enable_compact_called
 
     def test_unsupported_schema_fails(self):
-        """Schema version != 2 — immediate legacy fallback."""
+        """Schema version != 3 — immediate legacy fallback."""
         sched = _make_scheduler(world_size=2)
         recorder = _RecordingManager()
         sched.manager = recorder
@@ -860,7 +853,6 @@ class TestCompactConsensus:
             expected_world_size=2,
             schema_version=1,
             signature=ev.signature,
-            role_mapping_valid=True,
         )
         sched._process_compact_geometry_report(_meta([(0, bad)]))
         assert sched._compact_resolved
@@ -886,7 +878,7 @@ class TestCompactConsensusUpdateConnectorOutput:
         recorder = _RecordingManager()
         sched.manager = recorder
         ev0 = _make_evidence(rank=0)
-        ev1 = _make_evidence(rank=1, is_writer=False)
+        ev1 = _make_evidence(rank=1)
 
         sched.update_connector_output(self._output([(0, ev0), (1, ev1)]))
 
@@ -923,7 +915,7 @@ class TestCompactConsensusUpdateConnectorOutput:
         sched = _make_scheduler(world_size=2)
         sched.manager = manager
         ev0 = _make_evidence(rank=0)
-        ev1 = _make_evidence(rank=1, is_writer=False)
+        ev1 = _make_evidence(rank=1)
 
         with pytest.raises(error):
             sched.update_connector_output(self._output([(0, ev0), (1, ev1)]))
@@ -941,3 +933,218 @@ class TestConcreteManagerEnableCompact:
             manager.enable_compact(total_bytes=6553600, page_size=65536)
         assert not manager._compact_enabled
         assert manager._compact_allocator is None
+
+
+# ===================================================================
+# Receipt-based consensus tests
+# ===================================================================
+
+
+class TestCompactConsensusReceipt:
+    """Receipt equality replaces writer-role checks in compact consensus."""
+
+    def test_matching_receipts_activate(self):
+        """All ranks with identical receipts reach consensus."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (  # noqa: E501
+            CanonicalMappingReceipt,
+        )
+        from vllm.v1.kv_offload.base import CopyRun
+
+        receipt = CanonicalMappingReceipt(
+            per_layer=(
+                CanonicalMappingReceipt.LayerReceipt(
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=64,
+                    local_page_size_bytes=64,
+                    runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                    num_writers=2,
+                    writer_index=0,
+                    parallelism_agnostic=True,
+                ),
+            ),
+            per_rank=(
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=0,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=64,
+                        local_page_size_bytes=64,
+                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                        num_writers=2,
+                        writer_index=0,
+                        parallelism_agnostic=True,
+                    ),
+                ),
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=1,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=64,
+                        local_page_size_bytes=64,
+                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                        num_writers=2,
+                        writer_index=1,
+                        parallelism_agnostic=True,
+                    ),
+                ),
+            ),
+            fallback=False,
+            certified=True,
+        )
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        ev0 = _make_evidence(rank=0, receipt=receipt)
+        ev1 = _make_evidence(rank=1, receipt=receipt)
+        sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        sched._process_compact_geometry_report(_meta([(1, ev1)]))
+        assert sched._compact_resolved
+        assert recorder.enable_compact_called
+
+    def test_altered_receipt_rejected(self):
+        """Altered receipt (different runs) is rejected by consensus."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (  # noqa: E501
+            CanonicalMappingReceipt,
+        )
+        from vllm.v1.kv_offload.base import CopyRun
+
+        receipt = CanonicalMappingReceipt(
+            per_layer=(
+                CanonicalMappingReceipt.LayerReceipt(
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=64,
+                    local_page_size_bytes=64,
+                    runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                    num_writers=1,
+                    writer_index=0,
+                    parallelism_agnostic=True,
+                ),
+            ),
+            per_rank=(
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=0,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=64,
+                        local_page_size_bytes=64,
+                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                        num_writers=1,
+                        writer_index=0,
+                        parallelism_agnostic=True,
+                    ),
+                ),
+            ),
+            fallback=False,
+            certified=True,
+        )
+        altered = CanonicalMappingReceipt(
+            per_layer=(
+                CanonicalMappingReceipt.LayerReceipt(
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=128,  # DIFFERENT from baseline
+                    local_page_size_bytes=128,
+                    runs=(CopyRun(0, 0, 128, 1, 128, 128),),
+                    num_writers=1,
+                    writer_index=0,
+                    parallelism_agnostic=True,
+                ),
+            ),
+            per_rank=(
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=0,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=128,
+                        local_page_size_bytes=128,
+                        runs=(CopyRun(0, 0, 128, 1, 128, 128),),
+                        num_writers=1,
+                        writer_index=0,
+                        parallelism_agnostic=True,
+                    ),
+                ),
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=1,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=128,
+                        local_page_size_bytes=128,
+                        runs=(CopyRun(0, 0, 128, 1, 128, 128),),
+                        num_writers=1,
+                        writer_index=0,
+                        parallelism_agnostic=True,
+                    ),
+                ),
+            ),
+            fallback=False,
+            certified=True,
+        )
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        ev0 = _make_evidence(rank=0, receipt=receipt)
+        ev1 = _make_evidence(rank=1, receipt=altered)
+        sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        sched._process_compact_geometry_report(_meta([(1, ev1)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
+
+    def test_opaque_receipt_fallback_compact_rejected(self):
+        """Opaque/uncertified mapping receipt (fallback=True) fails closed."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (  # noqa: E501
+            CanonicalMappingReceipt,
+        )
+        from vllm.v1.kv_offload.base import CopyRun
+
+        opaque_receipt = CanonicalMappingReceipt(
+            per_layer=(
+                CanonicalMappingReceipt.LayerReceipt(
+                    layer_name="layer.0",
+                    canonical_page_size_bytes=128,
+                    local_page_size_bytes=64,
+                    runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                    num_writers=1,
+                    writer_index=0,
+                    parallelism_agnostic=False,
+                ),
+            ),
+            per_rank=(
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=0,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=128,
+                        local_page_size_bytes=64,
+                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                        num_writers=1,
+                        writer_index=0,
+                        parallelism_agnostic=False,
+                    ),
+                ),
+                CanonicalMappingReceipt.RankReceipt(
+                    rank=1,
+                    mapping=CanonicalMappingReceipt.LayerReceipt(
+                        layer_name="layer.0",
+                        canonical_page_size_bytes=128,
+                        local_page_size_bytes=64,
+                        runs=(CopyRun(0, 0, 64, 1, 64, 64),),
+                        num_writers=1,
+                        writer_index=0,
+                        parallelism_agnostic=False,
+                    ),
+                ),
+            ),
+            fallback=True,
+            certified=False,
+        )
+        sched = _make_scheduler(world_size=2)
+        recorder = _RecordingManager()
+        sched.manager = recorder
+
+        # Opaque mapping fails via group_available=False
+        ev0 = _make_evidence(rank=0, group_available=(False,), canonical_bytes=(0,),
+                             receipt=opaque_receipt)
+        sched._process_compact_geometry_report(_meta([(0, ev0)]))
+        assert sched._compact_resolved
+        assert not recorder.enable_compact_called
