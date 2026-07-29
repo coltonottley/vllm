@@ -1043,13 +1043,20 @@ def test_register_kv_caches_receipt_propagation():
     type(sm).compact_page_size = PropertyMock(return_value=65536)
     type(sm).compact_storage_budget_bytes = PropertyMock(return_value=10**9)
 
-    # Patch the exact symbol used by worker.py; wraps the real function so
-    # geometry, mappings, and real receipt are still produced.
+    # Patch the exact symbol used by worker.py. The wrapper calls the real
+    # owner and records the exact receipt object it returned.
     deriv_path = (
         "vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker"
         ".derive_canonical_mappings_with_receipt"
     )
-    with patch(deriv_path, wraps=_real_deriv) as mock_deriv:
+    returned_receipts = []
+
+    def recording_derivation(*args, **kwargs):
+        mappings, receipt = _real_deriv(*args, **kwargs)
+        returned_receipts.append(receipt)
+        return mappings, receipt
+
+    with patch(deriv_path, side_effect=recording_derivation) as mock_deriv:
         w = OffloadingConnectorWorker(
             spec=sm, vllm_config=_mock_vllm_config(), kv_cache_config=kcc
         )
@@ -1065,14 +1072,16 @@ def test_register_kv_caches_receipt_propagation():
     geom = rec.configure_calls[0]
     assert geom is not None
 
-    # Receipt reached _compact_rank_evidence.
+    # The exact receipt returned by the owner reached compact rank evidence.
     assert w._compact_rank_evidence is not None
     rct = w._compact_rank_evidence.receipt
+    assert returned_receipts == [rct]
+    assert rct is returned_receipts[0]
     assert rct is not None
     assert isinstance(rct, CanonicalMappingReceipt)
     assert rct.layer_names == ("model.layers.0.self_attn",)
     assert rct.certified
-    # The receipt contains the complete rank-major data.
+    # The receipt contains the complete layer-major, rank-minor data.
     assert len(rct.per_rank) == 1  # one rank, one layer
     assert rct.per_rank[0].rank == 0
     assert rct.per_rank[0].layer_name == "model.layers.0.self_attn"
