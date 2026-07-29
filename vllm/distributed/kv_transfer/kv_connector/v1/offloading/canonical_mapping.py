@@ -44,8 +44,8 @@ class CanonicalMappingReceipt:
         Ordered tuple of layer names, one per layer in group order.
     per_rank:
         Ordered tuple of RankReceipt entries: one per (rank, layer) pair.
-        The first group_size entries are for rank 0 across all layers,
-        then rank 1 across all layers, etc.
+        Order is layer-major, rank-minor: all ranks for layer 0 in order,
+        then all ranks for layer 1, etc.
     fallback:
         True if any layer uses opaque fallback (uncertified).
     certified:

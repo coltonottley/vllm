@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import torch
@@ -986,3 +986,93 @@ def test_register_kv_caches_plugin_no_geometry():
     assert spec.get_worker.called
     assert isinstance(spec.get_worker.call_args[0][0], CanonicalKVCaches)
     assert not hasattr(spec.get_worker.return_value, "_compact_geometry")
+
+
+def test_register_kv_caches_receipt_propagation():
+    """Exactly one call to derive_canonical_mappings_with_receipt; its
+    returned receipt reaches _compact_rank_evidence.receipt via the real
+    registration path.  Does not copy production logic."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (  # noqa: E501, I001
+        CanonicalMappingReceipt,
+        derive_canonical_mappings_with_receipt as _real_deriv,
+    )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum  # noqa: I001
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_config_packed  # noqa: I001
+    from vllm.v1.worker.utils import AttentionGroup  # noqa: I001
+
+    # Reuse the existing packed compact fixture from
+    # test_register_kv_caches_compact_geometry.
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    names = ["model.layers.0.self_attn"]
+    g = KVCacheGroupSpec(
+        layer_names=names,
+        kv_cache_spec=UniformTypeKVCacheSpecs(
+            block_size=BLOCK_SIZE, kv_cache_specs={ln: spec for ln in names}
+        ),
+    )
+    groups = [g]
+    nb, pts = _get_kv_cache_config_packed(_mock_vllm_config(), groups, 8 * 1024 * 1024)
+    bc = AttentionBackendEnum.CPU_ATTN.get_class()
+    kcc = KVCacheConfig(num_blocks=nb, kv_cache_tensors=pts, kv_cache_groups=groups)
+    ag = [
+        [
+            AttentionGroup(
+                backend=bc, layer_names=[ln], kv_cache_spec=spec, kv_cache_group_id=gi
+            )
+            for ln in gg.layer_names
+        ]
+        for gi, gg in enumerate(groups)
+    ]
+    kv = _allocate_and_reshape_kv_caches(kcc, ag, device=torch.device("cpu"))
+    rec = CompactRecordingWorker()
+    sm = MagicMock(spec=OffloadingSpec)
+    sm.replicated_layout = False
+    sm.config = MagicMock()
+    sm.config.parallel.rank = 0
+    sm.config.parallel.world_size = 1
+    sm.config.worker_kv_bytes_per_block = 1024
+    sm.blocks_per_chunk = 1
+    sm.extra_config = {"cpu_bytes_to_use": 10**9}
+    sm.get_worker.return_value = rec
+    type(sm).compact_layout_requested = PropertyMock(return_value=True)
+    type(sm).compact_page_size = PropertyMock(return_value=65536)
+    type(sm).compact_storage_budget_bytes = PropertyMock(return_value=10**9)
+
+    # Patch the exact symbol used by worker.py; wraps the real function so
+    # geometry, mappings, and real receipt are still produced.
+    deriv_path = (
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker"
+        ".derive_canonical_mappings_with_receipt"
+    )
+    with patch(deriv_path, wraps=_real_deriv) as mock_deriv:
+        w = OffloadingConnectorWorker(
+            spec=sm, vllm_config=_mock_vllm_config(), kv_cache_config=kcc
+        )
+        w.register_kv_caches(kv)
+
+        # Exactly one derivation call — no duplicate.
+        assert mock_deriv.call_count == 1, (
+            f"expected 1 call, got {mock_deriv.call_count}"
+        )
+
+    # Real geometry was constructed.
+    assert len(rec.configure_calls) == 1
+    geom = rec.configure_calls[0]
+    assert geom is not None
+
+    # Receipt reached _compact_rank_evidence.
+    assert w._compact_rank_evidence is not None
+    rct = w._compact_rank_evidence.receipt
+    assert rct is not None
+    assert isinstance(rct, CanonicalMappingReceipt)
+    assert rct.layer_names == ("model.layers.0.self_attn",)
+    assert rct.certified
+    # The receipt contains the complete rank-major data.
+    assert len(rct.per_rank) == 1  # one rank, one layer
+    assert rct.per_rank[0].rank == 0
+    assert rct.per_rank[0].layer_name == "model.layers.0.self_attn"
