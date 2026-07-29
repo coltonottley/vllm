@@ -33,6 +33,18 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 logger = init_logger(__name__)
 
 
+def _parse_enable_compact_layout(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"enable_compact_layout must be a boolean, got {value!r}")
+
+
 class CPUOffloadingSpec(OffloadingSpec):
     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     SUPPORTS_REPLICATED_LAYOUT = False

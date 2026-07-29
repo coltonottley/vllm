@@ -158,7 +158,7 @@ def plan_compact_transfer(
         Compact CPU addresses by group then address index.
     per_group_mappings:
         One tuple of ``CanonicalPageMapping`` per group, in layer order.
-        The direction parameter selects which ``MappedRun`` sequence to use
+        The direction parameter selects which ``CopyRun`` sequence to use
         (store_runs for store, load_runs for load).
     per_group_canonical_offsets:
         One tuple of canonical byte offsets per group, one per layer,
@@ -305,10 +305,15 @@ def plan_compact_transfer(
                 )
             ):
                 # Select runs based on direction
-                runs = mapping.store_runs if direction == "store" else mapping.load_runs
+                if direction == "store":
+                    if not mapping.is_writer(gpu_block_id):
+                        # Non-writer store mapping -> zero descriptors
+                        continue
+                    runs = mapping.runs
+                else:
+                    runs = mapping.runs
 
                 if not runs:
-                    # Non-writer store mapping -> zero descriptors
                     continue
 
                 for run in runs:

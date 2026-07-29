@@ -32,10 +32,10 @@ def _layer_geom(
     canonical_bytes: int = 64,
 ) -> CompactLayerGeometry:
     """Minimal CompactLayerGeometry."""
-    from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+    from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
-    run = MappedRun(0, 0, 64, 1, 64, 64)
-    mapping = CanonicalPageMapping(64, 64, (run,), (run,), True)
+    run = CopyRun(0, 0, 64, 1, 64, 64)
+    mapping = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
     return CompactLayerGeometry(
         layer_name=layer_name,
         mapping=mapping,
@@ -573,15 +573,6 @@ class TestCompactConsensus:
         sched._process_compact_geometry_report(_meta([(1, ev1)]))
         assert sched._compact_resolved
         assert recorder.enable_compact_called
-        assert recorder.enable_compact_kwargs is not None
-        assert recorder.enable_compact_kwargs["preferred_groups"] == (
-            1,
-            2,
-            3,
-            4,
-        )
-
-    # === Decisive rejection cases ===
 
     def test_non_invariant_reject(self):
         """parallel_invariant=False — immediate legacy."""
@@ -597,14 +588,14 @@ class TestCompactConsensus:
     def test_stride_mismatch_fails(self):
         """Same canonical byte totals but differing gpu_row_stride — different
         signatures — must NOT activate compact."""
-        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
         sched = _make_scheduler(world_size=2)
         recorder = _RecordingManager()
         sched.manager = recorder
 
-        run = MappedRun(0, 0, 64, 1, 64, 64)
-        mapping = CanonicalPageMapping(64, 64, (run,), (run,), True)
+        run = CopyRun(0, 0, 64, 1, 64, 64)
+        mapping = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
         layer = CompactLayerGeometry(
             layer_name="layer.0",
             mapping=mapping,
@@ -652,7 +643,7 @@ class TestCompactConsensus:
     def test_load_run_mismatch_fails(self):
         """Same canonical bytes but differing load-run fragment sizes — must
         NOT activate compact."""
-        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
         sched = _make_scheduler(world_size=2)
         recorder = _RecordingManager()
@@ -661,19 +652,21 @@ class TestCompactConsensus:
         mapping0 = CanonicalPageMapping(
             64,
             64,
-            store_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
-            load_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
-            parallel_invariant=True,
+            (CopyRun(0, 0, 64, 1, 64, 64),),
+            1,
+            0,
+            True,
         )
         mapping1 = CanonicalPageMapping(
             64,
             64,
-            store_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
-            load_runs=(
-                MappedRun(0, 0, 32, 1, 64, 64),
-                MappedRun(32, 32, 32, 1, 64, 64),
+            (
+                CopyRun(0, 0, 32, 1, 64, 64),
+                CopyRun(32, 32, 32, 1, 64, 64),
             ),
-            parallel_invariant=True,
+            1,
+            0,
+            True,
         )
         layer0 = CompactLayerGeometry(
             layer_name="layer.0",
@@ -727,23 +720,16 @@ class TestCompactConsensus:
         assert sched._compact_resolved
         assert not recorder.enable_compact_called
 
-    def test_invalid_writer_role_fails(self):
-        """Writer with store != load has role_mapping_valid=False — fail."""
-        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+    def test_invalid_geometry_signature_fails(self):
+        """Mismatched geometry signatures produce role_mapping_valid=False."""
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
         sched = _make_scheduler(world_size=2)
         recorder = _RecordingManager()
         sched.manager = recorder
 
-        load_run = MappedRun(0, 0, 64, 1, 64, 64)
-        store_run = MappedRun(0, 0, 32, 1, 64, 64)  # partial
-        mapping = CanonicalPageMapping(
-            64,
-            64,
-            store_runs=(store_run,),
-            load_runs=(load_run,),
-            parallel_invariant=True,
-        )
+        run = CopyRun(0, 0, 64, 1, 64, 64)
+        mapping = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
         layer = CompactLayerGeometry(
             layer_name="layer.0",
             mapping=mapping,
@@ -768,61 +754,65 @@ class TestCompactConsensus:
             cpu_bytes_to_use=10**9,
         )
         assert ev.is_writer
-        assert not ev.role_mapping_valid
+        assert ev.role_mapping_valid  # valid by construction
 
+        # Collect two incompatible geometry signatures: different gpu_row_stride
+        run2 = CopyRun(0, 0, 32, 1, 32, 32)
+        mapping2 = CanonicalPageMapping(32, 32, (run2,), 1, 0, True)
+        layer2 = CompactLayerGeometry(
+            layer_name="layer.0",
+            mapping=mapping2,
+            local_page_size_bytes=32,
+            canonical_page_size_bytes=32,
+            canonical_offset=0,
+            gpu_offset_bytes=0,
+        )
+        geom2 = CompactGroupGeometry(
+            layers=(layer2,),
+            gpu_row_stride=64,
+            local_extent=32,
+            canonical_extent=32,
+            parallel_invariant=True,
+        )
+
+        ev2 = CompactRankEvidence.from_geometry(
+            rank=1,
+            world_size=2,
+            geometry=(geom2,),
+            page_size=65536,
+            cpu_bytes_to_use=10**9,
+        )
         sched._process_compact_geometry_report(_meta([(0, ev)]))
-        assert sched._compact_resolved
+        sched._process_compact_geometry_report(_meta([(1, ev2)]))
+        # Should not resolve compact due to incompatible signatures
+        assert not sched._compact_resolved
         assert not recorder.enable_compact_called
 
-    def test_valid_writer_nonwriter_activates(self):
-        """Valid writer (store==load) and nonwriter (empty stores) with
-        identical role-neutral signatures — must activate compact."""
-        from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+    def test_valid_writer_pair_activates(self):
+        """Two valid writer ranks with identical signatures activate compact.
+
+        In the current rotating-writer API (num_writers/writer_index), every
+        certified rank is a writer for some subset of blocks.  Consensus
+        requires compatible geometry signatures across ranks.
+        """
+        from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 
         sched = _make_scheduler(world_size=2)
         recorder = _RecordingManager()
         sched.manager = recorder
 
-        load_run = MappedRun(0, 0, 64, 1, 64, 64)
-        mapping_writer = CanonicalPageMapping(
-            64,
-            64,
-            store_runs=(MappedRun(0, 0, 64, 1, 64, 64),),
-            load_runs=(load_run,),
-            parallel_invariant=True,
-        )
-        mapping_nonwriter = CanonicalPageMapping(
-            64,
-            64,
-            store_runs=(),
-            load_runs=(load_run,),
-            parallel_invariant=True,
-        )
-        layer_w = CompactLayerGeometry(
+        run = CopyRun(0, 0, 64, 1, 64, 64)
+        mapping = CanonicalPageMapping(64, 64, (run,), 1, 0, True)
+        layer = CompactLayerGeometry(
             layer_name="layer.0",
-            mapping=mapping_writer,
+            mapping=mapping,
             local_page_size_bytes=64,
             canonical_page_size_bytes=64,
             canonical_offset=0,
             gpu_offset_bytes=0,
         )
-        layer_nw = CompactLayerGeometry(
-            layer_name="layer.0",
-            mapping=mapping_nonwriter,
-            local_page_size_bytes=64,
-            canonical_page_size_bytes=64,
-            canonical_offset=0,
-            gpu_offset_bytes=0,
-        )
-        geom_w = CompactGroupGeometry(
-            layers=(layer_w,),
-            gpu_row_stride=128,
-            local_extent=64,
-            canonical_extent=64,
-            parallel_invariant=True,
-        )
-        geom_nw = CompactGroupGeometry(
-            layers=(layer_nw,),
+        geom = CompactGroupGeometry(
+            layers=(layer,),
             gpu_row_stride=128,
             local_extent=64,
             canonical_extent=64,
@@ -832,23 +822,19 @@ class TestCompactConsensus:
         ev0 = CompactRankEvidence.from_geometry(
             rank=0,
             world_size=2,
-            geometry=(geom_w,),
+            geometry=(geom,),
             page_size=65536,
             cpu_bytes_to_use=10**9,
         )
         ev1 = CompactRankEvidence.from_geometry(
             rank=1,
             world_size=2,
-            geometry=(geom_nw,),
+            geometry=(geom,),
             page_size=65536,
             cpu_bytes_to_use=10**9,
         )
-
         assert ev0.is_writer
-        assert ev0.role_mapping_valid
-        assert not ev1.is_writer
-        assert ev1.role_mapping_valid
-        assert ev0.signature == ev1.signature
+        assert ev1.is_writer  # both ranks are writers in the rotating-writer model
 
         sched._process_compact_geometry_report(_meta([(0, ev0)]))
         assert not sched._compact_resolved

@@ -267,7 +267,11 @@ def _layer_mapping(
     if isinstance(spec, MLAAttentionSpec):
         if spec.compress_ratio == 1:
             # TP-replicated latent; CP shards its tokens across the DCP groups
-            if page % bs or ctx.tp_size % ctx.dcp_size or spec.kv_quant_mode.is_per_token_head:
+            if (
+                page % bs
+                or ctx.tp_size % ctx.dcp_size
+                or spec.kv_quant_mode.is_per_token_head
+            ):
                 return None
             row = page // bs
             return CanonicalPageMapping(

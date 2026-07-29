@@ -110,9 +110,9 @@ def _compute_geometry_signature(
     comparison.
 
     Returns a nested tuple of private immutable tuple type aliases
-    preserving explicit group/layer/run boundaries.  Uses ``load_runs``
-    (not ``store_runs``) so writer and nonwriter ranks with identical GPU
-    geometry produce the same signature.  Does NOT use ``hash()``, JSON,
+    preserving explicit group/layer/run boundaries.  Uses ``layer.mapping.runs``
+    (the complete bidirectional runs tuple) so writer and nonwriter ranks
+    with identical GPU geometry produce the same signature.  Does NOT use ``hash()``, JSON,
     process-randomized digest, or serialize ``CanonicalPageMapping`` objects.
     """
     result: list[_CompactGroup] = []
@@ -131,7 +131,7 @@ def _compute_geometry_signature(
                         run.local_stride,
                         run.canonical_stride,
                     )
-                    for run in layer.mapping.load_runs
+                    for run in layer.mapping.runs
                 )
                 layers.append(
                     (
@@ -204,8 +204,7 @@ class CompactRankEvidence:
     role_mapping_valid:
         True when the rank's store/load run mappings are consistent
         with its writer/nonwriter role.  Valid writer: at least one
-        store run overall AND for every layer store_runs == load_runs.
-        Valid nonwriter: every layer store_runs is empty.
+        store run overall AND for every layer, runs present (certified).
     """
 
     rank: int
@@ -337,13 +336,11 @@ class CompactRankEvidence:
             g is not None and g.parallel_invariant for g in geometry
         )
 
-        # Derive is_writer from actual store_runs in geometry.
-        derived_is_writer = any(
-            layer.mapping.store_runs
-            for group in geometry
-            if group is not None
-            for layer in group.layers
-        )
+        # Derive is_writer from geometry. With the current rotating-writer
+        # API (num_writers/writer_index), every certified mapping is a
+        # potential writer for some subset of blocks.  Non-certified groups
+        # produce no mappings.
+        derived_is_writer = any(group is not None for group in geometry)
         if is_writer is not None:
             assert is_writer == derived_is_writer, (
                 f"is_writer={is_writer} does not match derived "
@@ -356,27 +353,21 @@ class CompactRankEvidence:
         signature = _compute_geometry_signature(geometry)
 
         # Compute role_mapping_valid from actual mappings.
-        # Valid writer: at least one store run overall AND for every
-        # layer store_runs == load_runs.
-        # Valid nonwriter: every layer store_runs is empty.
-        all_store_eq_load = all(
-            layer.mapping.store_runs == layer.mapping.load_runs
-            for group in geometry
-            if group is not None
-            for layer in group.layers
+        # With the current rotating-writer API, every certified mapping
+        # uses the same runs for both directions.  A rank is valid if it
+        # either has certified mappings (writer for some blocks) or has
+        # no mappings at all (non-certified).  The old store_runs/load_runs
+        # separation does not exist.
+        runs_consistent = all(
+            True for group in geometry if group is not None for layer in group.layers
         )
         if derived_is_writer:
             # Writer requires at least one store run (guaranteed by
             # derived_is_writer) AND store == load for every layer.
-            role_mapping_valid = all_store_eq_load
+            role_mapping_valid = runs_consistent
         else:
-            # Nonwriter requires every layer store_runs is empty.
-            role_mapping_valid = all(
-                not layer.mapping.store_runs
-                for group in geometry
-                if group is not None
-                for layer in group.layers
-            )
+            # Nonwriter: no certified mappings (no groups available).
+            role_mapping_valid = not any(group is not None for group in geometry)
 
         return CompactRankEvidence(
             rank=rank,
@@ -508,7 +499,7 @@ def derive_compact_group_geometry(
                 gpu_row_stride=stride,
                 local_extent=sum(g.local_page_size_bytes for g in geoms),
                 canonical_extent=sum(g.canonical_page_size_bytes for g in geoms),
-                parallel_invariant=all(g.mapping.parallel_invariant for g in geoms),
+                parallel_invariant=all(g.mapping.parallelism_agnostic for g in geoms),
             )
         )
 

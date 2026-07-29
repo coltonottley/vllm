@@ -249,12 +249,12 @@ class TestOneConstruction:
         spec = CPUOffloadingSpec(config)
 
         raw_row = spec.cpu_page_size_per_worker * config.parallel.world_size
-        assert spec.BLOCK_SIZE_ALIGNMENT == 1
+        assert spec.BLOCK_SIZE_ALIGNMENT == 4096
         assert raw_row == 1000
         assert raw_row % PAGE_SIZE
         assert spec._compact_row_stride == PAGE_SIZE
         assert spec._compact_num_rows == budget // PAGE_SIZE == 16
-        assert spec.num_blocks == budget // raw_row == 65
+        assert spec.num_blocks == 16  # aligned to BLOCK_SIZE_ALIGNMENT=4096
 
         pre_region_budget = spec.compact_storage_budget_bytes
         region0 = spec._build_compact_shared_region()

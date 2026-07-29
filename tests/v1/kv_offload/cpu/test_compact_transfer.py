@@ -10,7 +10,7 @@ per-layer geometry, without dependence on ``GroupCanonicalLayout`` or
 import numpy as np
 import pytest
 
-from vllm.v1.kv_offload.base import CanonicalPageMapping, MappedRun
+from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
 from vllm.v1.kv_offload.cpu.common import CompactCPUAddress, CompactCPUAddressSpan
 from vllm.v1.kv_offload.cpu.compact_transfer import (
     CompactTransferPlan,
@@ -26,15 +26,18 @@ from vllm.v1.kv_offload.cpu.compact_transfer import (
 def _identity_mapping(
     page_size: int,
     *,
-    store_runs: tuple[MappedRun, ...] | None = None,
+    num_writers: int = 1,
+    writer_index: int = 0,
 ) -> CanonicalPageMapping:
-    """Build an identity ``CanonicalPageMapping``.
+    """Build a certified identity ``CanonicalPageMapping``.
 
-    Single-fragment identity run — canonical == local — covering the full
-    page.  When *store_runs* is provided (e.g. empty tuple for non-writer),
-    it replaces the default identity store run exactly.
+    Single-fragment identity run -- canonical == local -- covering the full
+    page.  Writer election uses *num_writers* and *writer_index* so that
+    `mapping.is_writer(block_id)` returns ``block_id % num_writers == writer_index``.
+    All certified mappings carry the complete ``runs`` tuple;
+    stores gate on ``is_writer(gpu_block_id)``, loads use complete ``runs``.
     """
-    run = MappedRun(
+    run = CopyRun(
         local_offset=0,
         canonical_offset=0,
         fragment_size=page_size,
@@ -42,13 +45,13 @@ def _identity_mapping(
         local_stride=page_size,
         canonical_stride=page_size,
     )
-    s_runs = (run,) if store_runs is None else store_runs
     return CanonicalPageMapping(
         canonical_page_size_bytes=page_size,
         local_page_size_bytes=page_size,
-        store_runs=s_runs,
-        load_runs=(run,),
-        parallel_invariant=True,
+        runs=(run,),
+        num_writers=num_writers,
+        writer_index=writer_index,
+        parallelism_agnostic=True,
     )
 
 
@@ -250,37 +253,28 @@ class TestPlanCompactTransfer:
         assert int(plan.gpu_ptrs[0]) == 10000  # k at base
         assert int(plan.gpu_ptrs[1]) == 12048  # v at base + 2048
 
-    def test_identity_mapping_custom_store_runs(self):
-        """_identity_mapping preserves caller-supplied nonidentity store_runs
-        and defaults to identity run only when store_runs is None.
+    def test_identity_mapping_writer_election(self):
+        """_identity_mapping with num_writers>1 elects rotating writers.
 
-        Regression: the helper historically discarded a non-``None``
-        nonempty *store_runs* by overwriting it with the default identity
-        run.
+        Current API: writer status is per-block via is_writer(block_id).
+        num_writers=2 with writer_index=0 means even block IDs are writers.
         """
-        custom_run = MappedRun(
-            local_offset=10,
-            canonical_offset=20,
-            fragment_size=100,
-            num_fragments=1,
-            local_stride=100,
-            canonical_stride=100,
-        )
-        # Nonidentity store_runs preserved exactly
-        mapping = _identity_mapping(4096, store_runs=(custom_run,))
-        assert mapping.store_runs == (custom_run,), (
-            f"Expected {custom_run}, got {mapping.store_runs}"
-        )
-        # Default (None) produces identity store run
+        mapping_writer = _identity_mapping(4096, num_writers=2, writer_index=0)
+        mapping_reader = _identity_mapping(4096, num_writers=2, writer_index=1)
+        assert mapping_writer.is_writer(0)
+        assert not mapping_writer.is_writer(1)
+        assert mapping_writer.is_writer(2)
+        assert not mapping_reader.is_writer(0)
+        assert mapping_reader.is_writer(1)
+        assert not mapping_reader.is_writer(2)
         default_mapping = _identity_mapping(4096)
-        assert len(default_mapping.store_runs) == 1
-        assert default_mapping.store_runs[0].fragment_size == 4096
-        assert default_mapping.store_runs[0].local_offset == 0
-        # Empty tuple for non-writer
-        empty_mapping = _identity_mapping(4096, store_runs=())
-        assert empty_mapping.store_runs == (), (
-            f"Expected empty tuple, got {empty_mapping.store_runs}"
-        )
+        assert default_mapping.is_writer(0)
+        assert default_mapping.is_writer(1)
+        assert len(mapping_writer.runs) == 1
+        assert len(mapping_reader.runs) == 1
+        assert len(default_mapping.runs) == 1
+        assert mapping_writer.runs[0].fragment_size == 4096
+        assert mapping_writer.runs[0].local_offset == 0
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +329,7 @@ class TestFragmentedSpans:
             ),
         )
         # Custom mapping with small non-identity page
-        run = MappedRun(
+        run = CopyRun(
             local_offset=1,
             canonical_offset=1,
             fragment_size=4,
@@ -346,9 +340,10 @@ class TestFragmentedSpans:
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=18,
             local_page_size_bytes=18,
-            store_runs=(run,),
-            load_runs=(run,),
-            parallel_invariant=True,
+            runs=(run,),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
         )
         mappings = (mapping,)
         offsets = (0,)
@@ -391,7 +386,7 @@ class TestFragmentedSpans:
         # addr has logical_length = 4+4+8 = 16
         addr = _make_address(0, 16, group_idx=0, spans=spans)
 
-        run = MappedRun(
+        run = CopyRun(
             local_offset=0,
             canonical_offset=2,  # start at logical 2
             fragment_size=8,
@@ -402,9 +397,10 @@ class TestFragmentedSpans:
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=16,
             local_page_size_bytes=16,
-            store_runs=(run,),
-            load_runs=(run,),
-            parallel_invariant=True,
+            runs=(run,),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
         )
         mappings = (mapping,)
         offsets = (0,)
@@ -473,7 +469,7 @@ class TestFragmentedSpans:
             blocks_per_chunk=1,
             direction="store",
         )
-        # Simulate store: gpu -> cpu (store uses store_runs)
+        # Simulate store: gpu -> cpu (store uses is_writer(gpu_block_id))
         for gp, cp, sz in zip(plan.gpu_ptrs, plan.cpu_ptrs, plan.sizes):
             for j in range(int(sz)):
                 cpu_buf[int(cp) + j] = data[int(gp) + j]
@@ -502,14 +498,14 @@ class TestFragmentedSpans:
 
 
 # ---------------------------------------------------------------------------
-# Direction: store_runs vs load_runs
+# Direction: store is_writer filter vs load complete runs
 # ---------------------------------------------------------------------------
 
 
 class TestDirection:
-    def test_store_uses_store_runs(self):
-        """'store' direction uses store_runs for descriptor generation."""
-        run_store = MappedRun(
+    def test_store_filters_by_is_writer(self):
+        """'store' direction uses is_writer(gpu_block_id) to filter descriptors."""
+        run_store = CopyRun(
             local_offset=0,
             canonical_offset=0,
             fragment_size=4096,
@@ -520,9 +516,10 @@ class TestDirection:
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=4096,
             local_page_size_bytes=4096,
-            store_runs=(run_store,),
-            load_runs=(run_store,),
-            parallel_invariant=True,
+            runs=(run_store,),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
         )
         gpu_block_ids = np.array([0], dtype=np.int64)
         plan = plan_compact_transfer(
@@ -543,9 +540,9 @@ class TestDirection:
         assert plan.num_descriptors == 1
         assert plan.num_bytes == 4096
 
-    def test_load_uses_load_runs(self):
-        """'load' direction uses load_runs for descriptor generation."""
-        run_load = MappedRun(
+    def test_load_uses_complete_runs(self):
+        """'load' direction uses complete runs regardless of writer status."""
+        run_load = CopyRun(
             local_offset=0,
             canonical_offset=0,
             fragment_size=4096,
@@ -556,9 +553,10 @@ class TestDirection:
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=4096,
             local_page_size_bytes=4096,
-            store_runs=(),
-            load_runs=(run_load,),
-            parallel_invariant=True,
+            runs=(run_load,),
+            num_writers=2,
+            writer_index=1,
+            parallelism_agnostic=True,
         )
         gpu_block_ids = np.array([0], dtype=np.int64)
         plan = plan_compact_transfer(
@@ -580,13 +578,14 @@ class TestDirection:
         assert plan.num_bytes == 4096
 
     def test_nonwriter_store_returns_noop_plan(self):
-        """Empty store_runs (non-writer) returns valid zero-descriptor plan."""
+        """Non-writer mapping returns valid zero-descriptor plan for store."""
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=4096,
             local_page_size_bytes=4096,
-            store_runs=(),
-            load_runs=(MappedRun(0, 0, 4096, 1, 4096, 4096),),
-            parallel_invariant=True,
+            runs=(CopyRun(0, 0, 4096, 1, 4096, 4096),),
+            num_writers=2,
+            writer_index=1,
+            parallelism_agnostic=True,
         )
         gpu_block_ids = np.array([0], dtype=np.int64)
         plan = plan_compact_transfer(
@@ -617,21 +616,23 @@ class TestDirection:
         """Store with mixed writer/nonwriter layers: only writer-layer descriptors
         in store plan; load plan still includes both layers."""
         # Layer 0: writer with one 4096-byte store run
-        writer_run = MappedRun(0, 0, 4096, 1, 4096, 4096)
+        writer_run = CopyRun(0, 0, 4096, 1, 4096, 4096)
         writer_mapping = CanonicalPageMapping(
             4096,
             4096,
             (writer_run,),
-            (writer_run,),
+            1,
+            0,
             True,
         )
-        # Layer 1: non-writer (empty store_runs)
-        reader_run = MappedRun(0, 0, 4096, 1, 4096, 4096)
+        # Layer 1: non-writer (is_writer returns False for tested block)
+        reader_run = CopyRun(0, 0, 4096, 1, 4096, 4096)
         nonwriter_mapping = CanonicalPageMapping(
             4096,
             4096,
-            (),
             (reader_run,),
+            2,
+            1,
             True,
         )
         mappings = (writer_mapping, nonwriter_mapping)
@@ -693,7 +694,7 @@ class TestDirection:
             for i in range(2)
         ]
         # Load includes K at [0, 4096) and V at [4096, 8192)
-        # (both layers, though V has no store_runs)
+        # (both layers, though V is non-writer via is_writer)
         assert cpu_ranges[0] == (0, 4096), f"cpu_ranges[0]={cpu_ranges[0]}"
         assert cpu_ranges[1] == (4096, 8192), f"cpu_ranges[1]={cpu_ranges[1]}"
 
@@ -726,7 +727,7 @@ class TestBlocksPerChunk:
     def test_bsf_two_layer_major_ranges(self):
         """BSF=2, two layers: descriptor order is [K0,V0,K1,V1] (layer-major).
         CPU ranges: K0@[0,1024), V0@[1024,2048), K1@[2048,3072), V1@[3072,4096)."""
-        run = MappedRun(
+        run = CopyRun(
             local_offset=0,
             canonical_offset=0,
             fragment_size=1024,
@@ -739,9 +740,10 @@ class TestBlocksPerChunk:
             return CanonicalPageMapping(
                 canonical_page_size_bytes=1024,
                 local_page_size_bytes=1024,
-                store_runs=(run,),
-                load_runs=(run,),
-                parallel_invariant=True,
+                runs=(run,),
+                num_writers=1,
+                writer_index=0,
+                parallelism_agnostic=True,
             )
 
         k_mapping, v_mapping = _mk_page(), _mk_page()
@@ -782,7 +784,7 @@ class TestBlocksPerChunk:
 
     def test_fragment_exceeds_subblock_rejected(self):
         """Fragment larger than canonical sub-page is rejected."""
-        run = MappedRun(
+        run = CopyRun(
             local_offset=0,
             canonical_offset=0,
             fragment_size=2048,
@@ -793,9 +795,10 @@ class TestBlocksPerChunk:
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=1024,
             local_page_size_bytes=1024,
-            store_runs=(run,),
-            load_runs=(run,),
-            parallel_invariant=True,
+            runs=(run,),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
         )
         # Valid address: canonical_group_page_size=1024 * blocks_per_chunk=2
         with pytest.raises(ValueError, match="exceeds layer"):
@@ -816,7 +819,7 @@ class TestBlocksPerChunk:
 
     def test_partial_first_chunk(self):
         """block_idx offset produces partial first chunk access."""
-        run = MappedRun(
+        run = CopyRun(
             local_offset=0,
             canonical_offset=0,
             fragment_size=4096,
@@ -827,9 +830,10 @@ class TestBlocksPerChunk:
         mapping = CanonicalPageMapping(
             canonical_page_size_bytes=4096,
             local_page_size_bytes=4096,
-            store_runs=(run,),
-            load_runs=(run,),
-            parallel_invariant=True,
+            runs=(run,),
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
         )
         mappings = (mapping,)
         offsets = (0,)
@@ -1005,10 +1009,12 @@ class TestValidation:
 
     def test_overlapping_canonical_extents_rejected(self):
         """Overlapping layer canonical extents are rejected."""
-        k_run = MappedRun(0, 0, 4096, 1, 4096, 4096)
-        v_run = MappedRun(0, 0, 2048, 1, 2048, 2048)
-        k_mapping = CanonicalPageMapping(4096, 4096, (k_run,), (k_run,), True)
-        v_mapping = CanonicalPageMapping(2048, 2048, (v_run,), (v_run,), True)
+        k_run = CopyRun(0, 0, 4096, 1, 4096, 4096)
+        v_run = CopyRun(0, 0, 2048, 1, 2048, 2048)
+        k_mapping = CanonicalPageMapping(4096, 4096, (k_run,), 1, 0, True)
+
+        v_mapping = CanonicalPageMapping(2048, 2048, (v_run,), 1, 0, True)
+
         with pytest.raises(ValueError, match="extents.*overlap"):
             plan_compact_transfer(
                 gpu_base_ptr=10000,
@@ -1030,10 +1036,12 @@ class TestValidation:
         """Gapped canonical offsets are accepted with correct extent."""
         # K @ offset 0 (1024 bytes), V @ offset 8192 (2048 bytes)
         # Gap of 5120 bytes between extents.
-        k_run = MappedRun(0, 0, 1024, 1, 1024, 1024)
-        v_run = MappedRun(0, 0, 2048, 1, 2048, 2048)
-        k_mapping = CanonicalPageMapping(1024, 1024, (k_run,), (k_run,), True)
-        v_mapping = CanonicalPageMapping(2048, 2048, (v_run,), (v_run,), True)
+        k_run = CopyRun(0, 0, 1024, 1, 1024, 1024)
+        v_run = CopyRun(0, 0, 2048, 1, 2048, 2048)
+        k_mapping = CanonicalPageMapping(1024, 1024, (k_run,), 1, 0, True)
+
+        v_mapping = CanonicalPageMapping(2048, 2048, (v_run,), 1, 0, True)
+
         # canonical_group_page_size = max(0+1024, 8192+2048) = 10240
         expected_addr_len = 10240 * 1  # BSF=1
         gpu_block_ids = np.array([0], dtype=np.int64)
@@ -1077,8 +1085,9 @@ class TestValidation:
 
     def test_uint64_overflow_cpu_ptr_rejected(self):
         """CPU pointer exceeding uint64 max is rejected via base pointer."""
-        run = MappedRun(0, 0, 4096, 1, 4096, 4096)
-        mapping = CanonicalPageMapping(4096, 4096, (run,), (run,), True)
+        run = CopyRun(0, 0, 4096, 1, 4096, 4096)
+        mapping = CanonicalPageMapping(4096, 4096, (run,), 1, 0, True)
+
         with pytest.raises(ValueError, match="out of uint64 range"):
             plan_compact_transfer(
                 gpu_base_ptr=10000,
@@ -1105,8 +1114,9 @@ class TestD4Invariant:
     def test_nonzero_geometry_produces_bounded_plan(self):
         """Every CPU descriptor falls within [cpu_base_ptr, cpu_base_ptr +
         cpu_region_size)."""
-        run = MappedRun(0, 0, 4096, 1, 4096, 4096)
-        mapping = CanonicalPageMapping(4096, 4096, (run,), (run,), True)
+        run = CopyRun(0, 0, 4096, 1, 4096, 4096)
+        mapping = CanonicalPageMapping(4096, 4096, (run,), 1, 0, True)
+
         gpu_block_ids = np.array([0], dtype=np.int64)
         plan = plan_compact_transfer(
             gpu_base_ptr=10000,
@@ -1134,8 +1144,9 @@ class TestD4Invariant:
 
     def test_bounds_rejected_when_outside_region(self):
         """Descriptors exceeding the CPU region raise ValueError."""
-        run = MappedRun(0, 0, 4096, 1, 4096, 4096)
-        mapping = CanonicalPageMapping(4096, 4096, (run,), (run,), True)
+        run = CopyRun(0, 0, 4096, 1, 4096, 4096)
+        mapping = CanonicalPageMapping(4096, 4096, (run,), 1, 0, True)
+
         with pytest.raises(ValueError, match="exceeds backing region"):
             plan_compact_transfer(
                 gpu_base_ptr=10000,
@@ -1162,9 +1173,11 @@ class TestPerCopyDescriptors:
     def test_compact_produces_flat_descriptors(self):
         """Compact planning produces flat per-descriptor arrays (per-copy
         mode), not batched rows."""
-        run = MappedRun(0, 0, 4096, 1, 4096, 4096)
-        k_mapping = CanonicalPageMapping(4096, 4096, (run,), (run,), True)
-        v_mapping = CanonicalPageMapping(4096, 4096, (run,), (run,), True)
+        run = CopyRun(0, 0, 4096, 1, 4096, 4096)
+        k_mapping = CanonicalPageMapping(4096, 4096, (run,), 1, 0, True)
+
+        v_mapping = CanonicalPageMapping(4096, 4096, (run,), 1, 0, True)
+
         mappings = (k_mapping, v_mapping)
         offsets = (0, 4096)
         gpu_offsets = (0, 0)
@@ -1205,10 +1218,11 @@ class TestPerCopyDescriptors:
 class TestMultipleGroups:
     def test_two_groups(self):
         """Two independent groups produce separate descriptor sets."""
-        run0 = MappedRun(0, 0, 4096, 1, 4096, 4096)
-        m0 = CanonicalPageMapping(4096, 4096, (run0,), (run0,), True)
-        run1 = MappedRun(0, 0, 2048, 1, 2048, 2048)
-        m1 = CanonicalPageMapping(2048, 2048, (run1,), (run1,), True)
+        run0 = CopyRun(0, 0, 4096, 1, 4096, 4096)
+        m0 = CanonicalPageMapping(4096, 4096, (run0,), 1, 0, True)
+
+        run1 = CopyRun(0, 0, 2048, 1, 2048, 2048)
+        m1 = CanonicalPageMapping(2048, 2048, (run1,), 1, 0, True)
 
         gpu_block_ids = np.array([0, 5], dtype=np.int64)
         addresses = [
