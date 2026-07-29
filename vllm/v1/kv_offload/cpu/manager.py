@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable, Mapping
-from typing import Literal
 
 from typing_extensions import override
 
@@ -33,7 +32,6 @@ from vllm.v1.kv_offload.cpu.fixed_page_allocator import (
     FixedPageAllocator,
     PageAllocation,
 )
-from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 
@@ -110,11 +108,12 @@ class CPUOffloadingManager(OffloadingManager):
         # Preferred eviction group indices (compact only).
         self._compact_preferred_eviction_groups: set[int] = set()
 
-        # CPU entries are useful only as complete cross-group replay units.
-        # A key may be shared by multiple units; evicting one unit removes only
-        # keys no other resident unit still owns.
-        self._replay_units: dict[str, set[OffloadKey]] = {}
-        self._key_replay_units: dict[OffloadKey, set[str]] = {}
+        # Canonical cross-group replay units form a content-keyed antichain:
+        # no unit is a strict subset of any other.  A "unit" is a frozenset of
+        # resident OffloadKeys that together are required for one CPU-side replay.
+        # Completed units are published by content, not by request/job ID.
+        self._replay_units: set[frozenset[OffloadKey]] = set()
+        self._key_replay_units: dict[OffloadKey, set[frozenset[OffloadKey]]] = {}
 
     # --- public activation API ---
 
@@ -348,87 +347,122 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         protected: set[OffloadKey] | None = None,
-    ) -> tuple[list[OffloadKey], set[str]]:
+    ) -> tuple[list[OffloadKey], set[frozenset[OffloadKey]]]:
         """Purely plan complete replay units implied by policy candidates.
 
         ``protected`` is the set of keys that must NOT be evicted.  When
         expanding candidate keys to complete replay units, protected keys
         are excluded from the eviction set and their owning units are
         removed from victim consideration.
+
+        Returns (sorted evicted keys, set of victim canonical units).
         """
         if protected is None:
             protected = set()
-        victim_units: set[str] = set()
+        victim_units: set[frozenset[OffloadKey]] = set()
         pre_metadata_keys: list[OffloadKey] = []
         for key in keys:
             owners = self._key_replay_units.get(key)
             if owners and key not in protected:
-                victim_units.add(min(owners))
+                victim_units.add(min(owners, key=sorted))
             elif self._policy.get(key) is not None and key not in protected:
                 # Pre-metadata entries remain independently evictable.
                 pre_metadata_keys.append(key)
-        if pre_metadata_keys:
+        # When only pre-metadata keys exist, return them directly with an
+        # empty victim unit set (no canonical units to expand).
+        if pre_metadata_keys and not victim_units:
             return sorted(pre_metadata_keys), set()
 
         # Filter out victim units whose membership keys are all protected.
-        active_victim_units = set()
+        active_victim_units: set[frozenset[OffloadKey]] = set()
+        # Precompute unprotected keys per victim unit (avoids repeated set diffs).
+        unprotected_by_unit: dict[frozenset[OffloadKey], frozenset[OffloadKey]] = {}
         for unit in victim_units:
-            unit_keys = self._replay_units.get(unit, set())
-            unprotected_unit_keys = unit_keys - protected
-            if unprotected_unit_keys:
+            unprotected = unit - protected
+            if unprotected:
                 active_victim_units.add(unit)
+                unprotected_by_unit[unit] = unprotected
 
         evicted: set[OffloadKey] = set()
         for unit in active_victim_units:
-            for key in self._replay_units.get(unit, ()):
-                owners = self._key_replay_units.get(key, set())
+            for key in unprotected_by_unit[unit]:
+                owners = self._key_replay_units.get(key)
                 # Key is evicted if ALL its owners are being evicted
-                # AND the key itself is not protected.
-                if key not in protected and not (owners - active_victim_units):
+                # (subset check avoids allocation vs set difference).
+                if owners is not None and owners <= active_victim_units:
                     evicted.add(key)
+        # Merge independently evictable pre-metadata keys.  These are
+        # unowned (no canonical unit), so shared-owner semantics do not
+        # apply — they are always evictable when unprotected.
+        evicted.update(pre_metadata_keys)
         return sorted(evicted), active_victim_units
 
-    def _commit_replay_unit(self, unit: str, keys: Collection[OffloadKey]) -> None:
-        resident = {key for key in keys if self._policy.get(key) is not None}
-        old = self._replay_units.get(unit, set())
-        for key in old - resident:
-            owners = self._key_replay_units.get(key)
-            if owners is not None:
-                owners.discard(unit)
-                if not owners:
-                    self._key_replay_units.pop(key, None)
-        self._replay_units[unit] = resident
+    def _commit_canonical_replay_unit(self, keys: Collection[OffloadKey]) -> None:
+        """Publish a completed candidate as a canonical content-keyed unit.
+
+        ``keys`` is the completed request's ``store_replay_unit``.  Every key
+        that is resident in the policy must also be ready (fully stored, not
+        HIT_PENDING) before the unit is published.  If any resident member
+        is still pending, no unit is committed — that member may still fail.
+
+        Antichain semantics:
+        - If an equal or superset canonical unit already exists, skip.
+        - If the candidate strictly supersets existing units, remove those
+          dominated units, then add the candidate.
+        - Genuinely divergent incomparable units coexist.
+        """
+        if not keys:
+            return
+        # Require ALL resident members to be ready.  A pending member may
+        # still fail, so the unit must not be published yet.
+        for key in keys:
+            block = self._policy.get(key)
+            if block is not None and not block.is_ready:
+                return
+        # Collect the resident subset of keys (only ready keys pass the
+        # get/is_ready check above, so this is purely the ready set).
+        resident_set: set[OffloadKey] = {
+            key for key in keys if self._policy.get(key) is not None
+        }
+        if not resident_set:
+            return
+        resident = frozenset(resident_set)
+
+        # Superset check: skip if a superset/equal unit already exists.
+        for unit in self._replay_units:
+            if resident <= unit:
+                return
+
+        # Remove dominated units (those that are subsets of this candidate).
+        dominated: set[frozenset[OffloadKey]] = set()
+        for unit in self._replay_units:
+            if unit < resident:
+                dominated.add(unit)
+        if dominated:
+            self._replay_units.difference_update(dominated)
+            for key in resident:
+                owners = self._key_replay_units.get(key)
+                if owners is not None:
+                    owners.difference_update(dominated)
+                    if not owners:
+                        self._key_replay_units.pop(key, None)
+
+        # Publish the canonical unit.
+        self._replay_units.add(resident)
         for key in resident:
-            self._key_replay_units.setdefault(key, set()).add(unit)
+            self._key_replay_units.setdefault(key, set()).add(resident)
 
     def _commit_replay_eviction(
-        self, keys: Collection[OffloadKey], units: Collection[str]
+        self, keys: Collection[OffloadKey], units: Collection[frozenset[OffloadKey]]
     ) -> None:
         for unit in units:
-            for key in self._replay_units.pop(unit, set()):
+            self._replay_units.discard(unit)
+            for key in unit:
                 owners = self._key_replay_units.get(key)
                 if owners is not None:
                     owners.discard(unit)
                     if not owners:
                         self._key_replay_units.pop(key, None)
-
-    def _remove_key_from_replay_units(self, key: OffloadKey) -> None:
-        """Remove a failed key from every owning replay unit.
-
-        Cleans up the key's reverse mapping in ``_key_replay_units`` and
-        removes any replay unit that becomes empty.  Preserves unrelated
-        shared-key owners in the same unit.
-        """
-        owners = self._key_replay_units.get(key)
-        if owners is None:
-            return
-        for unit in owners:
-            unit_keys = self._replay_units.get(unit)
-            if unit_keys is not None:
-                unit_keys.discard(key)
-                if not unit_keys:
-                    self._replay_units.pop(unit, None)
-        self._key_replay_units.pop(key, None)
 
     # --- OffloadingManager interface ---
 
@@ -608,7 +642,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         victim_allocs: list[PageAllocation] = []
-        evicted_victim_units: set[str] = set()
+        evicted_victim_units: set[frozenset[OffloadKey]] = set()
 
         if bytes_needed > 0:
             if self._num_evictable_cache_blocks == 0:
@@ -737,7 +771,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         # Record replay unit ownership for cross-group coherence.
         if req_context.store_replay_unit:
-            self._commit_replay_unit(req_context.req_id, req_context.store_replay_unit)
+            self._commit_canonical_replay_unit(req_context.store_replay_unit)
 
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
 
@@ -784,14 +818,13 @@ class CPUOffloadingManager(OffloadingManager):
                     block.ref_cnt = 0
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
+            # Publish canonical replay unit after all success accounting.
+            if req_context.store_replay_unit:
+                self._commit_canonical_replay_unit(req_context.store_replay_unit)
         else:
-            # Remove the entire failed replay unit so no phantom ownership
-            # remains.  Keys shared with other (completed) units keep only
-            # their legitimate owners; keys unique to this unit lose their
-            # reverse mapping entirely.  This must happen before per-key
-            # policy/allocation cleanup so that the unit is removed
-            # exactly once regardless of how many keys are passed.
-            self._commit_replay_eviction([], [req_context.req_id])
+            # On failure: the unit was never committed (canonical units are
+            # content-published only on success).  Clean up per-key policy
+            # and allocation state.
             for key in keys:
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:

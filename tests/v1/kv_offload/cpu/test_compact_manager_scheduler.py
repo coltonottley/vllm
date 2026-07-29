@@ -94,7 +94,8 @@ class TestCrossGroupReplayUnits:
         b = [k("b0"), k("bs", 1)]
         store(m, "a", a)
         store(m, "b", b)
-        assert m._replay_units == {"a": set(a), "b": set(b)}
+        # Canonical units are frozensets of their resident content.
+        assert m._replay_units == {frozenset(a), frozenset(b)}
 
     def test_failed_replace_returns_none_preserves_all_state(self, monkeypatch):
         """None return from atomic_replace (ordinary no-fit): prepare_store
@@ -106,8 +107,8 @@ class TestCrossGroupReplayUnits:
         # Snapshot ALL state before failed transaction.
         before_alloc_used = alloc.used_bytes
         before_free = alloc.free_bytes
-        before_replay = {u: frozenset(v) for u, v in m._replay_units.items()}
-        before_key_replay = {k: frozenset(v) for k, v in m._key_replay_units.items()}
+        before_replay = set(m._replay_units)
+        before_key_replay = {k: set(v) for k, v in m._key_replay_units.items()}
         before_allocs = dict(m._compact_allocation_by_key)
         before_addrs = dict(m._compact_address_by_key)
         before_block_ids = dict(m._compact_block_id_by_key)
@@ -125,10 +126,8 @@ class TestCrossGroupReplayUnits:
         # All state must be byte/structurally unchanged.
         assert alloc.used_bytes == before_alloc_used
         assert alloc.free_bytes == before_free
-        assert {u: frozenset(v) for u, v in m._replay_units.items()} == before_replay
-        assert {
-            k: frozenset(v) for k, v in m._key_replay_units.items()
-        } == before_key_replay
+        assert set(m._replay_units) == before_replay
+        assert {k: set(v) for k, v in m._key_replay_units.items()} == before_key_replay
         assert dict(m._compact_allocation_by_key) == before_allocs
         assert dict(m._compact_address_by_key) == before_addrs
         assert dict(m._compact_block_id_by_key) == before_block_ids
@@ -151,8 +150,8 @@ class TestCrossGroupReplayUnits:
         # Snapshot ALL state before failed transaction.
         before_alloc_used = alloc.used_bytes
         before_free = alloc.free_bytes
-        before_replay = {u: frozenset(v) for u, v in m._replay_units.items()}
-        before_key_replay = {k: frozenset(v) for k, v in m._key_replay_units.items()}
+        before_replay = set(m._replay_units)
+        before_key_replay = {k: set(v) for k, v in m._key_replay_units.items()}
         before_allocs = dict(m._compact_allocation_by_key)
         before_addrs = dict(m._compact_address_by_key)
         before_block_ids = dict(m._compact_block_id_by_key)
@@ -176,10 +175,8 @@ class TestCrossGroupReplayUnits:
         # All state must be byte/structurally unchanged.
         assert alloc.used_bytes == before_alloc_used
         assert alloc.free_bytes == before_free
-        assert {u: frozenset(v) for u, v in m._replay_units.items()} == before_replay
-        assert {
-            k: frozenset(v) for k, v in m._key_replay_units.items()
-        } == before_key_replay
+        assert set(m._replay_units) == before_replay
+        assert {k: set(v) for k, v in m._key_replay_units.items()} == before_key_replay
         assert dict(m._compact_allocation_by_key) == before_allocs
         assert dict(m._compact_address_by_key) == before_addrs
         assert dict(m._compact_block_id_by_key) == before_block_ids
@@ -218,7 +215,7 @@ class TestCrossGroupReplayUnits:
         m = _make_manager()
         store(m, "a", [k("a0"), k("as", 1)])
         m.reset_cache()
-        assert m._replay_units == {} and m._key_replay_units == {}
+        assert m._replay_units == set() and m._key_replay_units == {}
 
     def test_compact_enabled_survives_reset(self):
         m = _make_manager()
@@ -229,7 +226,7 @@ class TestCrossGroupReplayUnits:
         assert m._compact_enabled
         # Compact data cleared.
         assert m._compact_allocation_by_key == {}
-        assert m._replay_units == {}
+        assert m._replay_units == set()
 
     # ---- replay-closure-aware fit predicate regression ----
 
@@ -308,8 +305,8 @@ class TestCrossGroupReplayUnits:
         store(m, "b", [shared, b])
 
         # Snapshot all mutable state.
-        before_replay = {u: frozenset(v) for u, v in m._replay_units.items()}
-        before_key_replay = {k: frozenset(v) for k, v in m._key_replay_units.items()}
+        before_replay = set(m._replay_units)
+        before_key_replay = {k: set(v) for k, v in m._key_replay_units.items()}
         before_allocs = dict(m._compact_allocation_by_key)
         before_evictable = m._num_evictable_cache_blocks
         before_free = m._compact_allocator.free_bytes
@@ -328,10 +325,8 @@ class TestCrossGroupReplayUnits:
         )
 
         # Zero mutation: all state must be byte/structurally unchanged.
-        assert {u: frozenset(v) for u, v in m._replay_units.items()} == before_replay
-        assert {
-            k: frozenset(v) for k, v in m._key_replay_units.items()
-        } == before_key_replay
+        assert set(m._replay_units) == before_replay
+        assert {k: set(v) for k, v in m._key_replay_units.items()} == before_key_replay
         assert dict(m._compact_allocation_by_key) == before_allocs
         assert m._num_evictable_cache_blocks == before_evictable
         assert m._compact_allocator.free_bytes == before_free
@@ -481,14 +476,16 @@ class TestCompactStoreLoadCycle:
         m.complete_load([key], ReqContext("r2"))
 
     def test_failed_store_removes_key(self):
-        """Failed store removes policy, allocation, and replay ownership."""
+        """Failed store: no canonical unit (committed only on success). Keys removed."""
         m = _make_manager(10, compact_total=65536)
         key = k("test_fail", 0)
         ctx = ReqContext("r1", store_replay_unit=(key,))
         out = m.prepare_store([key], ctx)
         assert out is not None
-        assert m._replay_units == {"r1": {key}}
-        assert m._key_replay_units == {key: {"r1"}}
+        # Canonical units are committed only on success.  After prepare,
+        # no persistent replay unit exists yet.
+        assert m._replay_units == set()
+        assert m._key_replay_units == {}
 
         m.complete_store([key], ctx, success=False)
 
@@ -496,30 +493,42 @@ class TestCompactStoreLoadCycle:
         assert key not in m._compact_allocation_by_key
         assert key not in m._compact_address_by_key
         assert key not in m._compact_block_id_by_key
-        assert key not in m._key_replay_units
-        assert "r1" not in m._replay_units
+        assert m._key_replay_units == {}
+        assert m._replay_units == set()
         assert m._num_write_pending_blocks == 0
+
+    def test_successful_store_commits_canonical_unit(self):
+        """Successful complete_store publishes canonical unit (no req/job IDs)."""
+        m = _make_manager(10, compact_total=65536)
+        key = k("test_key", 0)
+        ctx = ReqContext("r1", store_replay_unit=(key,))
+        out = m.prepare_store([key], ctx)
+        assert out is not None
+
+        # No unit committed during prepare.
+        assert m._replay_units == set()
+
+        m.complete_store([key], ctx)
+        assert m.lookup(key, ReqContext("p")) is LookupResult.HIT
+        # Canonical unit is frozenset of resident keys (no req_id).
+        assert m._replay_units == {frozenset({key})}
+        assert m._key_replay_units.get(key) == {frozenset({key})}
 
     def test_failed_store_shared_key_no_phantom_owner(self):
         """Regression: failed store must not leave phantom replay-unit
         ownership for shared keys.
 
+        Canonical units are committed only on successful complete_store,
+        so a failing complete_store has nothing to clean up.
+
         Scenario:
         - old={shared} completed successfully.
-          shared owned by {'old'}.
-        - new={shared, a(group0), b(group1)} prepared.
-          shared already resident, a and b are new.
-          After prepare_store / _commit_replay_unit,
-          _replay_units['new'] == {shared, a, b}.
-        - complete_store([a, b], new_ctx, success=False).
-
-        After failure:
-        - 'new' must not appear in _replay_units at all.
-        - shared must have owners exactly {'old'}.
-        - a and b absent from policy, allocations, addresses, block_ids.
-        - shared remains HIT (old still owns it).
-        - _num_write_pending_blocks == 0.
-        - allocator used_bytes returned to pre-prepare state.
+          shared owned by frozenset({shared}).
+        - new={shared, a(group0), b(group1)} prepared then failed.
+        - After failure:
+          - shared still owned by the same canonical unit.
+          - a and b absent from policy, allocations, addresses, block_ids.
+          - shared remains HIT.
         """
         m = _make_manager(10, compact_total=65536, group_payload={0: 4096, 1: 4096})
 
@@ -529,9 +538,10 @@ class TestCompactStoreLoadCycle:
         assert out is not None
         m.complete_store([shared], old_ctx)
         assert m.lookup(shared, ReqContext("p")) is LookupResult.HIT
-        assert m._key_replay_units[shared] == {"old"}, (
-            f"After old complete, shared owners must be {{'old'}}, "
-            f"got {m._key_replay_units[shared]}"
+        old_unit = frozenset({shared})
+        assert m._key_replay_units.get(shared) == {old_unit}, (
+            f"After old complete, shared owners must be {{{old_unit}}}, "
+            f"got {m._key_replay_units.get(shared)}"
         )
 
         alloc = m._compact_allocator
@@ -546,23 +556,23 @@ class TestCompactStoreLoadCycle:
             f"shared already stored, only a,b should be keys_to_store, "
             f"got {out.keys_to_store}"
         )
-        assert m._replay_units.get("new") == {shared, a, b}, (
-            f"After prepare_store, new unit should own {{shared,a,b}}, "
-            f"got {m._replay_units.get('new')}"
+        # New system: no unit committed during prepare.
+        assert m._replay_units == {old_unit}, (
+            "During prepare, no new canonical unit is published yet"
         )
-        assert m._key_replay_units[shared] == {"old", "new"}, (
-            f"Shared must have owners {{'old','new'}} after prepare, "
-            f"got {m._key_replay_units[shared]}"
+        assert m._key_replay_units.get(shared) == {old_unit}, (
+            f"Shared owners unchanged during prepare: "
+            f"got {m._key_replay_units.get(shared)}"
         )
 
         m.complete_store([a, b], new_ctx, success=False)
 
-        assert "new" not in m._replay_units, (
-            f"Failed unit 'new' must be absent from _replay_units, "
-            f"leftover: {m._replay_units.get('new')}"
+        # After failure: old unit still owns shared; no phantom.
+        assert m._replay_units == {old_unit}, (
+            f"After failed store, only old_unit should remain, got {m._replay_units}"
         )
-        assert m._key_replay_units.get(shared) == {"old"}, (
-            f"Shared must have owners exactly {{'old'}}, "
+        assert m._key_replay_units.get(shared) == {old_unit}, (
+            f"Shared owners unchanged after failure: "
             f"got {m._key_replay_units.get(shared)}"
         )
         assert m.lookup(a, ReqContext("p")) is LookupResult.MISS
@@ -806,3 +816,290 @@ def test_manager_address_length_matches_chunked_payload():
     output = manager.prepare_store([key], ctx)
     assert output is not None
     assert output.store_spec.compact_addresses[0].logical_length == 12288
+
+
+# ---- content-keyed antichain focused tests ----
+
+
+class TestCanonicalReplayAntichain:
+    """Content-keyed antichain semantics for canonical replay units."""
+
+    def _make(self, total_bytes=65536):
+        m = CPUOffloadingManager(num_blocks=20, cache_policy="arc", enable_events=True)
+        assert m.resolve_compact_mode(
+            enable=True,
+            total_bytes=total_bytes,
+            page_size=4096,
+            group_payload_bytes={0: 4096, 1: 4096},
+        )
+        return m
+
+    def _store(self, m, ru_keys):
+        ctx = ReqContext("r", store_replay_unit=tuple(ru_keys))
+        out = m.prepare_store(ru_keys, ctx)
+        assert out is not None
+        m.complete_store(out.keys_to_store, ctx)
+        return ctx
+
+    def test_nested_collapse_to_one_maximal(self):
+        """Nested subset units collapse to one maximal canonical unit."""
+        m = self._make()
+        # Store: A has keys[:2], B has keys[:4] (superset of A)
+        keys = [k("ka"), k("kb"), k("kc"), k("kd")]
+        self._store(m, keys[:2])
+        self._store(m, keys[:4])
+        # Only one maximal unit: frozenset(keys[:4])
+        assert m._replay_units == {frozenset(keys[:4])}, (
+            f"A (subset) must collapse into B (superset), got {m._replay_units}"
+        )
+
+    def test_divergent_units_coexist(self):
+        """Genuinely incomparable units coexist."""
+        m = self._make()
+        a = [k("a0"), k("a1")]
+        b = [k("b0"), k("b1")]
+        self._store(m, a)
+        self._store(m, b)
+        assert m._replay_units == {frozenset(a), frozenset(b)}, (
+            f"Incomparable units must coexist, got {m._replay_units}"
+        )
+
+    def test_dominated_replacement(self):
+        """Candidate supersets existing: dominated units removed, candidate added."""
+        m = self._make()
+        a = [k("a0"), k("a1")]
+        b = [k("a0"), k("a1"), k("b0")]
+        self._store(m, a)
+        self._store(m, b)
+        # a is a subset of b, so a is removed.
+        assert m._replay_units == {frozenset(b)}, (
+            f"Dominated unit must be replaced by superset, got {m._replay_units}"
+        )
+
+    def test_failed_pending_preserves_existing(self):
+        """Failed complete_store: no unit published, metadata preserved."""
+        m = self._make()
+        keys = [k("k0"), k("k1")]
+        # Successfully store one unit.
+        self._store(m, keys)
+        assert m._replay_units == {frozenset(keys)}
+
+        # Attempt a new store that fails.
+        new_keys = [k("n0"), k("n1")]
+        ctx = ReqContext("fail", store_replay_unit=tuple(new_keys))
+        out = m.prepare_store(new_keys, ctx)
+        assert out is not None
+        # No new unit committed during prepare.
+        assert m._replay_units == {frozenset(keys)}
+        m.complete_store(out.keys_to_store, ctx, success=False)
+        # After failure: existing metadata untouched.
+        assert m._replay_units == {frozenset(keys)}, (
+            f"Failed store must preserve existing units, got {m._replay_units}"
+        )
+
+    def test_eviction_cleanup(self):
+        """Eviction removes canonical units consistently."""
+        m = self._make(total_bytes=12288)  # 3 pages
+        a = [k("a0"), k("a1")]
+        b = [k("b0"), k("b1")]
+        self._store(m, a)  # uses 2 pages
+        self._store(m, b)  # uses 2 pages but eviction triggers
+        # Pool was 3 pages (12288), b needs 2 pages, pool has 1 free.
+        # After b's complete_store: eviction removed a's unit.
+        assert frozenset(a) not in m._replay_units, (
+            f"Evicted unit must be removed, remaining: {m._replay_units}"
+        )
+        assert frozenset(b) in m._replay_units
+
+    def test_reset_cleanup(self):
+        """reset_cache clears all canonical units."""
+        m = self._make()
+        self._store(m, [k("x")])
+        assert m._replay_units
+        m.reset_cache()
+        assert m._replay_units == set()
+        assert m._key_replay_units == {}
+
+    # --- 200-nested-unit helper for boundary and timing tests ---
+
+    @staticmethod
+    def _koff(i):
+        return make_offload_key(i.to_bytes(8, "little"), 0)
+
+    @staticmethod
+    def _populate_200_nested():
+        """Return (mgr, keys, prefix, resident) with 200 nested units collapsed to 1."""
+        n_units = 200
+        prefix = 100
+        tail = 2
+        resident = prefix + n_units * tail  # 500
+        m = CPUOffloadingManager(num_blocks=resident + 1000, cache_policy="arc")
+        assert m.resolve_compact_mode(
+            enable=True,
+            total_bytes=resident * 4096,
+            page_size=4096,
+            group_payload_bytes={0: 4096},
+        )
+        keys = [
+            TestCanonicalReplayAntichain._koff(i) for i in range(resident + resident)
+        ]
+        for u in range(n_units):
+            end = prefix + (u + 1) * tail
+            ks = keys[:end]
+            c = ReqContext(f"r{u:06}", store_replay_unit=tuple(ks))
+            o = m.prepare_store(ks, c)
+            assert o is not None
+            m.complete_store(o.keys_to_store, c)
+        assert len(m._replay_units) == 1
+        return m, keys, prefix, resident
+
+    def test_400_success_401_no_fit(self):
+        """400 fit, 401 no-fit on independent managers."""
+        m400, keys, prefix, resident = self._populate_200_nested()
+        new400 = keys[resident : resident + 400]
+        c400 = ReqContext("fit400", store_replay_unit=tuple(keys[:prefix] + new400))
+        o400 = m400.prepare_store(new400, c400)
+        assert o400 is not None
+        assert len(o400.evicted_keys) == 400
+
+        m401, keys2, _, _ = self._populate_200_nested()
+        new401 = keys2[resident : resident + 401]
+        c401 = ReqContext("nofit401", store_replay_unit=tuple(keys2[:prefix] + new401))
+        o401 = m401.prepare_store(new401, c401)
+        assert o401 is None
+
+    def test_exact_400_no_fit_antichain_units_zero_request_ids(self):
+        """Verify zero request/job IDs in canonical metadata."""
+        m, keys, _, _ = self._populate_200_nested()
+        for unit in m._replay_units:
+            assert isinstance(unit, frozenset)
+            for uk in unit:
+                assert isinstance(uk, bytes)
+        for key, owners in m._key_replay_units.items():
+            assert isinstance(key, bytes)
+            for owner in owners:
+                assert isinstance(owner, frozenset)
+
+    def test_pre_metadata_cache_fairness(self):
+        """Pre-metadata keys contribute; cache must not suppress later candidates."""
+        m = CPUOffloadingManager(num_blocks=6, cache_policy="arc")
+        assert m.resolve_compact_mode(
+            enable=True,
+            total_bytes=12288,  # 3 pages
+            page_size=4096,
+            group_payload_bytes={0: 4096},
+        )
+
+        def _store_unowned(mgr, ks):
+            c = ReqContext("u")
+            o = mgr.prepare_store(ks, c)
+            assert o is not None
+            mgr.complete_store(o.keys_to_store, c)
+
+        k = lambda i: make_offload_key(i.to_bytes(8, "little"), 0)
+        _store_unowned(m, [k(1)])
+        _store_unowned(m, [k(2)])
+        _store_unowned(m, [k(3)])
+
+        incoming = [k(10), k(11)]
+        ctx = ReqContext("incoming", store_replay_unit=tuple(incoming))
+        out = m.prepare_store(incoming, ctx)
+        assert out is not None, "2 unowned keys must free 8192 bytes"
+        assert len(out.evicted_keys) == 2, (
+            f"Expected 2 evicted, got {len(out.evicted_keys)}: {out.evicted_keys}"
+        )
+
+    def _mk_split_mgr(self):
+        m = CPUOffloadingManager(num_blocks=10, cache_policy="arc")
+        assert m.resolve_compact_mode(
+            enable=True,
+            total_bytes=24576,
+            page_size=4096,
+            group_payload_bytes={0: 4096, 1: 4096},
+        )
+        return m
+
+    def test_split_completion_cases(self):
+        """Split completion: first only -> no unit; fail second -> no phantom."""
+        k0 = make_offload_key(b"split0", 0)
+        k1 = make_offload_key(b"split1", 1)
+
+        m = self._mk_split_mgr()
+        ctx = ReqContext("s", store_replay_unit=(k0, k1))
+        out = m.prepare_store([k0, k1], ctx)
+        assert out is not None
+        m.complete_store([k0], ctx)
+        assert m.lookup(k0, ReqContext("p")) is LookupResult.HIT
+        assert m.lookup(k1, ReqContext("p")) is LookupResult.HIT_PENDING
+        assert m._replay_units == set()
+
+        m.complete_store([k1], ctx, success=False)
+        assert m.lookup(k1, ReqContext("p")) is LookupResult.MISS
+        assert m._replay_units == set()
+        assert m._key_replay_units == {}
+
+        m2 = self._mk_split_mgr()
+        out2 = m2.prepare_store([k0, k1], ctx)
+        assert out2 is not None
+        m2.complete_store([k0], ctx)
+        assert m2._replay_units == set()
+        m2.complete_store([k1], ctx)
+        exp = frozenset({k0, k1})
+        assert m2._replay_units == {exp}
+        assert m2._key_replay_units.get(k0) == {exp}
+        assert m2._key_replay_units.get(k1) == {exp}
+
+    def test_400_successful_replacement_timing(self):
+        """200 nested histories needing exactly 400 pages: timing <0.5s."""
+        import time
+
+        m, keys, prefix, resident = self._populate_200_nested()
+        new400 = keys[resident : resident + 400]
+        protected = keys[:prefix] + new400
+        ctx = ReqContext("fit400", store_replay_unit=tuple(protected))
+        t0 = time.perf_counter()
+        out = m.prepare_store(new400, ctx)
+        dt = time.perf_counter() - t0
+        assert out is not None
+        assert len(out.evicted_keys) == 400
+        assert dt < 0.5, f"400-key replacement took {dt:.6f}s"
+
+    def test_mixed_pre_metadata_and_canonical_eviction(self):
+        """5-page pool (3 unowned + canonical unit{2}); incoming needs 4.
+        Fit must combine pre-metadata keys and unit expansion.
+        """
+        m = CPUOffloadingManager(num_blocks=10, cache_policy="arc")
+        assert m.resolve_compact_mode(
+            enable=True,
+            total_bytes=20480,
+            page_size=4096,
+            group_payload_bytes={0: 4096},
+        )
+
+        def _k(i):
+            return make_offload_key(i.to_bytes(8, "little"), 0)
+
+        def _store(mgr, ks, ru=None):
+            c = ReqContext("r", store_replay_unit=tuple(ru or ()))
+            o = mgr.prepare_store(ks, c)
+            assert o is not None
+            mgr.complete_store(o.keys_to_store, c)
+
+        _store(m, [_k(1)])
+        _store(m, [_k(2)])
+        _store(m, [_k(3)])
+        _store(m, [_k(4), _k(5)], ru=[_k(4), _k(5)])
+        assert len(m._replay_units) == 1
+        assert _k(1) not in m._key_replay_units  # unowned
+
+        incoming = [_k(10), _k(11), _k(12), _k(13)]
+        ctx = ReqContext("mix", store_replay_unit=tuple(incoming))
+        out = m.prepare_store(incoming, ctx)
+        assert out is not None
+        evicted_set = set(out.evicted_keys)
+        assert len(out.evicted_keys) == 5, (
+            f"Expected 5 evicted, got {len(out.evicted_keys)}: {out.evicted_keys}"
+        )
+        assert all(_k(i) in evicted_set for i in (1, 2, 3, 4, 5))
+        assert m._replay_units == set()
+        assert _k(4) not in m._key_replay_units
