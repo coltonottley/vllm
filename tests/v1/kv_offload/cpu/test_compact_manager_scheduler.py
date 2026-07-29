@@ -927,13 +927,13 @@ class TestCanonicalReplayAntichain:
         return make_offload_key(i.to_bytes(8, "little"), 0)
 
     @staticmethod
-    def _populate_200_nested():
-        """Return (mgr, keys, prefix, resident) with 200 nested units collapsed to 1."""
+    def _populate_200_nested(cache_policy="arc"):
+        """Return a manager with 200 nested histories collapsed to one unit."""
         n_units = 200
         prefix = 100
         tail = 2
         resident = prefix + n_units * tail  # 500
-        m = CPUOffloadingManager(num_blocks=resident + 1000, cache_policy="arc")
+        m = CPUOffloadingManager(num_blocks=resident + 1000, cache_policy=cache_policy)
         assert m.resolve_compact_mode(
             enable=True,
             total_bytes=resident * 4096,
@@ -953,20 +953,72 @@ class TestCanonicalReplayAntichain:
         assert len(m._replay_units) == 1
         return m, keys, prefix, resident
 
-    def test_400_success_401_no_fit(self):
-        """400 fit, 401 no-fit on independent managers."""
-        m400, keys, prefix, resident = self._populate_200_nested()
+    @staticmethod
+    def _manager_state_snapshot(m):
+        """Structural snapshot of every state surface a no-fit probe may touch."""
+
+        def block_items(items):
+            return tuple((key, block.ref_cnt, block.block_id) for key, block in items)
+
+        policy = m._policy
+        if hasattr(policy, "t1"):
+            policy_state = (
+                "arc",
+                block_items(policy.t1.items()),
+                block_items(policy.t2.items()),
+                tuple(policy.b1),
+                tuple(policy.b2),
+                policy.target_t1_size,
+            )
+        else:
+            policy_state = (
+                "lru",
+                block_items(policy.blocks.items()),
+                tuple(policy.evictable_blocks),
+            )
+
+        allocator = m._compact_allocator
+        assert allocator is not None
+        return (
+            policy_state,
+            tuple(allocator._free_pages),
+            tuple(allocator._allocated.items()),
+            allocator._next_handle_id,
+            tuple(m._compact_allocation_by_key.items()),
+            tuple(m._compact_address_by_key.items()),
+            tuple(m._compact_block_id_by_key.items()),
+            frozenset(m._replay_units),
+            tuple(
+                (key, frozenset(units)) for key, units in m._key_replay_units.items()
+            ),
+            m._num_evictable_cache_blocks,
+            m._num_write_pending_blocks,
+            m._num_allocated_blocks,
+            m._compact_pending_store_bytes,
+            tuple(m._free_list),
+            tuple(m.counts.items()) if m.counts is not None else None,
+            m.stores_skipped_in_current_batch,
+            tuple(m.allocation_sizes_in_current_batch),
+            tuple(m.events or ()),
+        )
+
+    @pytest.mark.parametrize("cache_policy", ["arc", "lru"])
+    def test_400_success_401_no_fit(self, cache_policy):
+        """Both policies evict the exact 400 resident victims; 401 is atomic."""
+        m400, keys, prefix, resident = self._populate_200_nested(cache_policy)
         new400 = keys[resident : resident + 400]
         c400 = ReqContext("fit400", store_replay_unit=tuple(keys[:prefix] + new400))
         o400 = m400.prepare_store(new400, c400)
         assert o400 is not None
         assert len(o400.evicted_keys) == 400
+        assert set(o400.evicted_keys) == set(keys[prefix:resident])
 
-        m401, keys2, _, _ = self._populate_200_nested()
-        new401 = keys2[resident : resident + 401]
-        c401 = ReqContext("nofit401", store_replay_unit=tuple(keys2[:prefix] + new401))
-        o401 = m401.prepare_store(new401, c401)
-        assert o401 is None
+        m401, keys2, prefix2, resident2 = self._populate_200_nested(cache_policy)
+        before = self._manager_state_snapshot(m401)
+        new401 = keys2[resident2 : resident2 + 401]
+        c401 = ReqContext("nofit401", store_replay_unit=tuple(keys2[:prefix2] + new401))
+        assert m401.prepare_store(new401, c401) is None
+        assert self._manager_state_snapshot(m401) == before
 
     def test_exact_400_no_fit_antichain_units_zero_request_ids(self):
         """Verify zero request/job IDs in canonical metadata."""
