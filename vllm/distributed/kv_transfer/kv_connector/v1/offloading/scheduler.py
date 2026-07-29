@@ -75,6 +75,9 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Immutable scheduler snapshot of the complete cross-group replay unit
+    # associated with this store job. Empty for load jobs.
+    store_replay_unit: tuple[OffloadKey, ...] = ()
     # Store src block IDs whose ref_cnt protects them while the request
     # runs. Only registered in _block_id_to_pending_jobs on request_finished.
     non_sliding_window_block_ids: list[int] | None = None
@@ -1236,12 +1239,12 @@ class OffloadingConnectorScheduler:
                     latest_prompt_tail_only=self.config.offload_latest_prompt_tail_only,
                     prompt_final=prompt_final,
                 )
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             req_status.req_context.store_replay_unit = tuple(
                 dict.fromkeys(replay_unit_keys)
             )
+            store_replay_unit = req_status.req_context.store_replay_unit
             try:
                 store_output = self.manager.prepare_store(
                     new_offload_keys, req_status.req_context
@@ -1261,7 +1264,6 @@ class OffloadingConnectorScheduler:
                     latest_prompt_tail_only=self.config.offload_latest_prompt_tail_only,
                     prompt_final=prompt_final,
                 )
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             self._touch(req_status)
@@ -1342,6 +1344,7 @@ class OffloadingConnectorScheduler:
                 pending_count=self.config.num_workers,
                 keys=set(keys_to_store),
                 is_store=True,
+                store_replay_unit=store_replay_unit,
                 non_sliding_window_block_ids=non_sliding_window_block_ids,
                 sliding_window_block_ids=sliding_window_block_ids or None,
             )
@@ -1508,7 +1511,14 @@ class OffloadingConnectorScheduler:
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                self.manager.complete_store(
+                    job_status.keys,
+                    ReqContext(
+                        req_id=job_status.req_id,
+                        kv_transfer_params=req_status.req_context.kv_transfer_params,
+                        store_replay_unit=job_status.store_replay_unit,
+                    ),
+                )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:

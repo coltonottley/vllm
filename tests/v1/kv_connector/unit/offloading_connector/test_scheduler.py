@@ -1504,9 +1504,16 @@ def test_fence_at_build_store_jobs(request_runner):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_complete_store_called_per_job(request_runner, async_scheduling: bool):
-    """complete_store fires per-job, not deferred to request finish.
-    Each call carries only that store's keys."""
+def test_complete_store_called_per_job(
+    request_runner, async_scheduling: bool, monkeypatch
+):
+    """complete_store fires per-job with each job's immutable replay snapshot."""
+    import vllm.platforms
+    import vllm.platforms.cpu  # noqa: F401
+
+    monkeypatch.setattr(
+        vllm.platforms, "_current_platform", vllm.platforms.cpu.CpuPlatform()
+    )
     tokens_per_block = 4
     blocks_per_chunk = 3
     tokens_per_chunk = tokens_per_block * blocks_per_chunk
@@ -1517,25 +1524,48 @@ def test_complete_store_called_per_job(request_runner, async_scheduling: bool):
         async_scheduling=async_scheduling,
     )
     runner.new_request(token_ids=[0] * tokens_per_chunk)
+    prepared_replay_units = []
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
-        generate_store_output(keys)
+        prepared_replay_units.append(tuple(req_context.store_replay_unit))
+        or generate_store_output(keys)
     )
 
     # First store: fires when block 0 is fully populated.
     runner.run(decoded_tokens=[0, 0], expected_stored=(0, 1, 2))
     assert runner.manager.complete_store.call_count == 1
     first_call_keys = set(runner.manager.complete_store.call_args.args[0])
+    first_ctx = runner.manager.complete_store.call_args.args[1]
     assert len(first_call_keys) == 1
+    assert tuple(first_ctx.store_replay_unit) == prepared_replay_units[0]
+    assert (
+        first_ctx
+        is not runner.connector_scheduler._req_status[str(runner.req_id)].req_context
+    )
+    assert (
+        runner.connector_scheduler._req_status[
+            str(runner.req_id)
+        ].req_context.store_replay_unit
+        == ()
+    )
     runner.manager.complete_store.reset_mock()
 
-    # Second store: fires when block 1 is fully populated, with different keys.
+    # Second store: completion carries a different job-local snapshot/context.
     runner.run(
         decoded_tokens=[0] * (tokens_per_chunk + 1),
         expected_stored=(3, 4, 5),
     )
     assert runner.manager.complete_store.call_count == 1
     second_call_keys = set(runner.manager.complete_store.call_args.args[0])
+    second_ctx = runner.manager.complete_store.call_args.args[1]
     assert first_call_keys != second_call_keys
+    assert tuple(second_ctx.store_replay_unit) == prepared_replay_units[1]
+    assert second_ctx is not first_ctx
+    assert (
+        runner.connector_scheduler._req_status[
+            str(runner.req_id)
+        ].req_context.store_replay_unit
+        == ()
+    )
     runner.manager.complete_store.reset_mock()
 
     # Finish: no store pending -> no further call.
@@ -3277,6 +3307,14 @@ def test_latest_prompt_tail_offload(request_runner, monkeypatch):
         g2 = sum(1 for k in keys if get_offload_group_idx(k) == 2)
         stored_counts.append((g0, g1, g2))
         replay_units.append(ru)
+
+        # The newly-created asynchronous job owns the exact call-scoped
+        # replay snapshot after the request context has been cleared.
+        current_job = max(
+            runner.connector_scheduler._jobs.values(),
+            key=lambda job: len(job.store_replay_unit),
+        )
+        assert current_job.store_replay_unit == ru
 
         gs = runner.connector_scheduler._req_status[str(runner.req_id)].group_states
         next_stored_list.append(tuple(g.next_stored_chunk_idx for g in gs))
