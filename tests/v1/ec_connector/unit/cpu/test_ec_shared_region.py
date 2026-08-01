@@ -114,22 +114,30 @@ def test_wait_for_file_size_times_out_when_file_stays_empty(tmp_path):
 
 def test_pin_memory_success_sets_flag(region):
     """When cudaHostRegister returns 0, _is_pinned flips to True
-    and cleanup will correspondingly call cudaHostUnregister."""
-    fake_cudart = MagicMock()
-    success = MagicMock()
-    success.value = 0
-    fake_cudart.cudaHostRegister.return_value = success
-    fake_cudart.cudaHostUnregister.return_value = success
+    and cleanup will correspondingly call cudaHostUnregister exactly once
+    through the retained CudaRTLibrary handle."""
+    fake_lib = MagicMock()
+    fake_lib.cudaHostRegister.return_value = 0  # 0 == success (raw cudaError_t)
+    fake_lib.cudaHostUnregister.return_value = 0
 
     with (
         patch("torch.cuda.is_available", return_value=True),
-        patch("torch.cuda.cudart", return_value=fake_cudart),
+        patch(
+            "vllm.distributed.ec_transfer.ec_connector.cpu.ec_shared_region"
+            ".CudaRTLibrary",
+            return_value=fake_lib,
+        ),
     ):
         region.pin_memory()
         assert region._is_pinned is True
+        # The retained same-handle owner is stored on success.
+        assert region._cudart_lib is fake_lib
         # cleanup must pair with cudaHostUnregister exactly once.
         region.cleanup()
-        fake_cudart.cudaHostUnregister.assert_called_once()
+        fake_lib.cudaHostUnregister.assert_called_once()
+        # Repeat cleanup is a no-op through the cleared owner.
+        region.cleanup()
+        fake_lib.cudaHostUnregister.assert_called_once()
 
 
 def test_pin_memory_failure_leaves_flag_false():
@@ -137,20 +145,27 @@ def test_pin_memory_failure_leaves_flag_false():
     cleanup must NOT call cudaHostUnregister on memory we never registered."""
     r = _make_region()
     try:
-        fake_cudart = MagicMock()
-        fail = MagicMock()
-        fail.value = 1  # non-zero == error
-        fake_cudart.cudaHostRegister.return_value = fail
+        fake_lib = MagicMock()
+        fake_lib.cudaHostRegister.return_value = 1  # non-zero == error
+        fake_lib.drain_pending_error.return_value = 1
 
         with (
             patch("torch.cuda.is_available", return_value=True),
-            patch("torch.cuda.cudart", return_value=fake_cudart),
+            patch(
+                "vllm.distributed.ec_transfer.ec_connector.cpu.ec_shared_region"
+                ".CudaRTLibrary",
+                return_value=fake_lib,
+            ),
         ):
             r.pin_memory()
+            # Failed registration drains the pending error on the retained
+            # handle and stores no owner.
             assert r._is_pinned is False
+            assert r._cudart_lib is None
+            fake_lib.drain_pending_error.assert_called_once()
             # Now run cleanup and verify cudaHostUnregister was NOT called.
             r.cleanup()
-            fake_cudart.cudaHostUnregister.assert_not_called()
+            fake_lib.cudaHostUnregister.assert_not_called()
     finally:
         r.cleanup()
 
