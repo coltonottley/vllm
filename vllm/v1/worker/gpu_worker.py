@@ -79,7 +79,11 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    init_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import warmup_kernels
@@ -895,6 +899,275 @@ class Worker(WorkerBase):
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
+
+    # ------------------------------------------------------------------
+    # Read-only per-rank diagnostic snapshot (collective-RPC safe)
+    # ------------------------------------------------------------------
+    #
+    # ``get_rank_diagnostic_snapshot`` is a named, collective-RPC-safe worker
+    # method: ``executor.collective_rpc("get_rank_diagnostic_snapshot")`` runs
+    # it on every rank and returns one JSON-serializable dict per rank. It only
+    # READS already-instantiated state and never mutates CUDA or model state:
+    # no empty_cache, no peak resets, no determine_available_memory, no
+    # capture/compile, no cache/graph clears, no unnecessary synchronization,
+    # and no lazy instantiation (breakable captures and workspace slots are
+    # reported only when already instantiated). All string output is bounded.
+
+    _SNAPSHOT_SCHEMA_VERSION = 1
+    _SNAPSHOT_MAX_ENTRIES = 64
+    _SNAPSHOT_MAX_ADDRESSES = 256
+    _SNAPSHOT_MAX_STRING = 256
+    _SNAPSHOT_MEMORY_STATS_PREFIXES = (
+        "inactive_split",
+        "num_alloc_retries",
+        "num_ooms",
+        "num_oom_rejections",
+        "num_device_alloc",
+        "num_device_free",
+        "oversize_",
+        "max_split_size",
+    )
+
+    @staticmethod
+    def _snapshot_bounded_repr(value: Any, max_len: int = 256) -> str:
+        """JSON-safe bounded string form of an arbitrary value.
+
+        Truncates long reprs so a snapshot stays bounded regardless of what
+        it is asked to describe.
+        """
+        text = repr(value)
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + f"...<truncated {len(text) - max_len} chars>"
+
+    def _snapshot_cuda_memory(self) -> dict[str, Any] | None:
+        """Read-only CUDA allocator snapshot for this rank's device.
+
+        Returns None when this worker is not on a CUDA device. Queries only
+        read-only torch.cuda state (allocated/reserved/max, cudaMemGetInfo,
+        and the allocator's inactive-split/retry counters); never flushes
+        caches, resets peaks, profiles available memory, or synchronizes.
+        """
+        device = self.device
+        if device is None or getattr(device, "type", "") != "cuda":
+            return None
+        try:
+            result: dict[str, Any] = {
+                "memory_allocated_bytes": torch.cuda.memory_allocated(device),
+                "memory_reserved_bytes": torch.cuda.memory_reserved(device),
+                "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                "max_memory_reserved_bytes": torch.cuda.max_memory_reserved(device),
+            }
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            result["mem_get_info"] = {
+                "free_bytes": int(free_bytes),
+                "total_bytes": int(total_bytes),
+            }
+            selected: dict[str, int] = {}
+            for key, value in torch.cuda.memory_stats(device).items():
+                if isinstance(value, int) and key.startswith(
+                    self._SNAPSHOT_MEMORY_STATS_PREFIXES
+                ):
+                    selected[key] = value
+            result["memory_stats"] = selected
+            return result
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"error": self._snapshot_bounded_repr(exc)}
+
+    def _snapshot_breakable(self) -> dict[str, Any] | None:
+        """Read-only summary of an already-instantiated breakable wrapper.
+
+        Returns None when breakable is not enabled or no wrapper is
+        instantiated on this rank. Reads only stored state: entry count,
+        bounded descriptor summaries, per-entry graph/segment counts, the
+        graph pool identity, and static input address identities. Never
+        allocates, captures, or clears graphs.
+        """
+        from vllm.compilation.breakable_cudagraph import (
+            BreakableCUDAGraphWrapper,
+            is_breakable_cudagraph_enabled,
+        )
+
+        if not is_breakable_cudagraph_enabled():
+            return None
+
+        runner = self.model_runner
+        if runner is None:
+            return None
+
+        # Canonical owner paths to the wrapper: the V2 model runner keeps it
+        # on the cudagraph manager; the V1 model runner wraps the model
+        # directly. No mirrored registry is consulted.
+        wrapper: BreakableCUDAGraphWrapper | None = None
+        candidate = getattr(
+            getattr(runner, "cudagraph_manager", None), "breakable_cg_runner", None
+        )
+        if isinstance(candidate, BreakableCUDAGraphWrapper):
+            wrapper = candidate
+        if wrapper is None:
+            candidate = getattr(runner, "model", None)
+            if isinstance(candidate, BreakableCUDAGraphWrapper):
+                wrapper = candidate
+        if wrapper is None:
+            return None
+
+        entries = list(wrapper.entries.items())
+        max_entries = self._SNAPSHOT_MAX_ENTRIES
+        max_addresses = self._SNAPSHOT_MAX_ADDRESSES
+        entry_summaries: list[dict[str, Any]] = []
+        # Exact totals are accumulated across ALL entries (they are bounded
+        # ints); only the per-entry detail is capped/truncated.
+        total_graph_segments = 0
+        total_eager_breaks = 0
+        total_input_addresses = 0
+        for index, (desc, entry) in enumerate(entries):
+            capture = entry.capture
+            graph_segments = None
+            eager_breaks = None
+            if capture is not None:
+                graph_segments = int(capture.num_graphs or 0)
+                eager_breaks = int(capture.num_eager_breaks or 0)
+                total_graph_segments += graph_segments
+                total_eager_breaks += eager_breaks
+            addresses = entry.input_addresses
+            address_count = None
+            if addresses is not None:
+                address_count = len(addresses)
+                total_input_addresses += address_count
+            if index < max_entries:
+                entry_summaries.append(
+                    {
+                        "descriptor": self._snapshot_bounded_repr(desc),
+                        "graph_segments": graph_segments,
+                        "eager_breaks": eager_breaks,
+                        "input_address_count": address_count,
+                        "input_addresses": (
+                            addresses[:max_addresses] if addresses is not None else None
+                        ),
+                    }
+                )
+
+        return {
+            "entry_count": len(entries),
+            "entries_reported": len(entry_summaries),
+            "entries_truncated": len(entries) > max_entries,
+            "entries": entry_summaries,
+            "total_graph_segments": total_graph_segments,
+            "total_eager_breaks": total_eager_breaks,
+            "total_input_addresses": total_input_addresses,
+            "graph_pool_identity": id(wrapper.graph_pool),
+            "graph_pool_repr": self._snapshot_bounded_repr(wrapper.graph_pool),
+        }
+
+    def _snapshot_compilation(self) -> dict[str, Any] | None:
+        """Effective compilation / breakable mode.
+
+        Reads the canonical compilation config plus the instantiated cudagraph
+        manager's resolved mode. Read-only; never compiles or captures.
+        """
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+
+        compilation_config = getattr(self, "compilation_config", None)
+        if compilation_config is None:
+            return None
+
+        def _mode_name(enum_value: Any) -> str | None:
+            name = getattr(enum_value, "name", None)
+            if isinstance(name, str):
+                return name
+            return (
+                None if enum_value is None else self._snapshot_bounded_repr(enum_value)
+            )
+
+        mode = getattr(compilation_config, "mode", None)
+        configured_cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+        backend = getattr(compilation_config, "backend", None)
+
+        # Effective (resolved) mode prefers the instantiated cudagraph
+        # manager's resolved mode; falls back to the configured value.
+        cg_manager = (
+            getattr(self.model_runner, "cudagraph_manager", None)
+            if self.model_runner is not None
+            else None
+        )
+        effective_mode = getattr(cg_manager, "cudagraph_mode", None)
+        if effective_mode is None:
+            effective_mode = configured_cudagraph_mode
+
+        breakable = self._snapshot_breakable()
+        return {
+            "compilation_mode": _mode_name(mode),
+            "cudagraph_mode": _mode_name(effective_mode),
+            "configured_cudagraph_mode": _mode_name(configured_cudagraph_mode),
+            "backend": self._snapshot_bounded_repr(backend),
+            "torch_compile_active": bool(
+                mode is not None and getattr(mode, "value", 0) != 0
+            ),
+            "breakable_enabled": bool(is_breakable_cudagraph_enabled()),
+            "breakable_active": breakable is not None,
+            "breakable": breakable,
+        }
+
+    def _snapshot_workspace(self) -> dict[str, Any] | None:
+        """Known already-instantiated lazy workspace sizes/identities.
+
+        Reports only workspace slots that are already instantiated (non-None);
+        reading tensor size/data_ptr never instantiates or mutates anything.
+        Returns None when the workspace manager has not been initialized.
+        """
+        if not is_workspace_manager_initialized():
+            return None
+        manager = current_workspace_manager()
+        slots = getattr(manager, "_current_workspaces", None)
+        instantiated: list[dict[str, Any]] = []
+        if isinstance(slots, (list, tuple)):
+            for ubatch_id, ws in enumerate(slots):
+                if ws is None:
+                    continue
+                instantiated.append(
+                    {
+                        "ubatch_id": ubatch_id,
+                        "bytes": int(ws.numel()) * int(ws.element_size()),
+                        "data_ptr": int(ws.data_ptr()),
+                    }
+                )
+        return {
+            "initialized": True,
+            "locked": bool(manager.is_locked()),
+            "num_ubatch_slots": (
+                len(slots) if isinstance(slots, (list, tuple)) else None
+            ),
+            "instantiated_count": len(instantiated),
+            "instantiated": instantiated,
+        }
+
+    def get_rank_diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return a JSON-serializable, read-only per-rank diagnostic snapshot.
+
+        Collective-RPC safe: invoke on every rank via
+        ``executor.collective_rpc("get_rank_diagnostic_snapshot")``.
+
+        The snapshot only READS state. It never calls ``empty_cache``,
+        ``reset_peak_memory_stats``, ``determine_available_memory``,
+        graph capture/compile, cache/graph clears, or an unnecessary
+        synchronization, and it never instantiates lazy objects (breakable
+        captures and workspace slots are reported only when already
+        instantiated) or mutates counters. Breakable/graph-pool/static-input
+        and workspace details come from the canonical owner objects only.
+        """
+        return {
+            "schema_version": self._SNAPSHOT_SCHEMA_VERSION,
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "driver_worker": bool(getattr(self, "is_driver_worker", False)),
+            "device": str(self.device) if self.device is not None else None,
+            "pid": os.getpid(),
+            "cuda": self._snapshot_cuda_memory(),
+            "compilation": self._snapshot_compilation(),
+            "workspace": self._snapshot_workspace(),
+        }
 
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
