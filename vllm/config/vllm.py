@@ -105,6 +105,22 @@ IS_DENSE = False
 # See https://github.com/vllm-project/vllm/issues/25689.
 
 
+def _should_auto_enable_deepseek_v4_breakable_cudagraph(
+    model_config: ModelConfig,
+) -> bool:
+    # DeepSeek-V4 does NOT auto-enable breakable cudagraph. Breakable mode
+    # disables the torch.compile pipeline (equivalent to -O.mode=none) and runs
+    # attention eagerly every decode step; on SM12x that is 1.5-3.8x SLOWER for
+    # MTP decode and degrades with output length, measured on both RTX PRO 6000
+    # (SM120) and 2x GB10 (SM121). FULL_AND_PIECEWISE + torch.compile is correct
+    # (GSM8K parity, bare-prompt clean) and faster, so it is the default.
+    # Opt in with VLLM_USE_BREAKABLE_CUDAGRAPH=1 for the MTP + long-context +
+    # high-concurrency garbled-output workaround (which also engages the
+    # spec-decode attention eager-break).
+    del model_config  # architecture-independent: never auto-enable
+    return False
+
+
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
     """Enable if either RMS norm or quant FP8 custom op is active;
     otherwise Inductor handles fusion."""
@@ -1189,17 +1205,18 @@ class VllmConfig:
         if (
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
+            and (
+                _should_auto_enable_deepseek_v4_breakable_cudagraph(self.model_config)
+                or any(
+                    a
+                    in (
+                        "InklingForCausalLM",
+                        "InklingForConditionalGeneration",
+                        "MiniMaxM3SparseForCausalLM",
+                        "MiniMaxM3SparseForConditionalGeneration",
+                    )
+                    for a in self.model_config.architectures
                 )
-                for a in self.model_config.architectures
             )
         ):
             os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
