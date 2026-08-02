@@ -981,83 +981,93 @@ class Worker(WorkerBase):
         instantiated on this rank. Reads only stored state: entry count,
         bounded descriptor summaries, per-entry graph/segment counts, the
         graph pool identity, and static input address identities. Never
-        allocates, captures, or clears graphs.
+        allocates, captures, or clears graphs. A per-block read failure is
+        isolated and reported as ``{"error": ...}`` (matching
+        ``_snapshot_cuda_memory``) so a single rank's structural surprise
+        cannot fail the whole collective.
         """
         from vllm.compilation.breakable_cudagraph import (
             BreakableCUDAGraphWrapper,
             is_breakable_cudagraph_enabled,
         )
 
-        if not is_breakable_cudagraph_enabled():
-            return None
+        try:
+            if not is_breakable_cudagraph_enabled():
+                return None
 
-        runner = self.model_runner
-        if runner is None:
-            return None
+            runner = self.model_runner
+            if runner is None:
+                return None
 
-        # Canonical owner paths to the wrapper: the V2 model runner keeps it
-        # on the cudagraph manager; the V1 model runner wraps the model
-        # directly. No mirrored registry is consulted.
-        wrapper: BreakableCUDAGraphWrapper | None = None
-        candidate = getattr(
-            getattr(runner, "cudagraph_manager", None), "breakable_cg_runner", None
-        )
-        if isinstance(candidate, BreakableCUDAGraphWrapper):
-            wrapper = candidate
-        if wrapper is None:
-            candidate = getattr(runner, "model", None)
+            # Canonical owner paths to the wrapper: the V2 model runner keeps
+            # it on the cudagraph manager; the V1 model runner wraps the
+            # model directly. No mirrored registry is consulted.
+            wrapper: BreakableCUDAGraphWrapper | None = None
+            candidate = getattr(
+                getattr(runner, "cudagraph_manager", None),
+                "breakable_cg_runner",
+                None,
+            )
             if isinstance(candidate, BreakableCUDAGraphWrapper):
                 wrapper = candidate
-        if wrapper is None:
-            return None
+            if wrapper is None:
+                candidate = getattr(runner, "model", None)
+                if isinstance(candidate, BreakableCUDAGraphWrapper):
+                    wrapper = candidate
+            if wrapper is None:
+                return None
 
-        entries = list(wrapper.entries.items())
-        max_entries = self._SNAPSHOT_MAX_ENTRIES
-        max_addresses = self._SNAPSHOT_MAX_ADDRESSES
-        entry_summaries: list[dict[str, Any]] = []
-        # Exact totals are accumulated across ALL entries (they are bounded
-        # ints); only the per-entry detail is capped/truncated.
-        total_graph_segments = 0
-        total_eager_breaks = 0
-        total_input_addresses = 0
-        for index, (desc, entry) in enumerate(entries):
-            capture = entry.capture
-            graph_segments = None
-            eager_breaks = None
-            if capture is not None:
-                graph_segments = int(capture.num_graphs or 0)
-                eager_breaks = int(capture.num_eager_breaks or 0)
-                total_graph_segments += graph_segments
-                total_eager_breaks += eager_breaks
-            addresses = entry.input_addresses
-            address_count = None
-            if addresses is not None:
-                address_count = len(addresses)
-                total_input_addresses += address_count
-            if index < max_entries:
-                entry_summaries.append(
-                    {
-                        "descriptor": self._snapshot_bounded_repr(desc),
-                        "graph_segments": graph_segments,
-                        "eager_breaks": eager_breaks,
-                        "input_address_count": address_count,
-                        "input_addresses": (
-                            addresses[:max_addresses] if addresses is not None else None
-                        ),
-                    }
-                )
+            entries = list(wrapper.entries.items())
+            max_entries = self._SNAPSHOT_MAX_ENTRIES
+            max_addresses = self._SNAPSHOT_MAX_ADDRESSES
+            entry_summaries: list[dict[str, Any]] = []
+            # Exact totals are accumulated across ALL entries (they are
+            # bounded ints); only the per-entry detail is capped/truncated.
+            total_graph_segments = 0
+            total_eager_breaks = 0
+            total_input_addresses = 0
+            for index, (desc, entry) in enumerate(entries):
+                capture = entry.capture
+                graph_segments = None
+                eager_breaks = None
+                if capture is not None:
+                    graph_segments = int(capture.num_graphs or 0)
+                    eager_breaks = int(capture.num_eager_breaks or 0)
+                    total_graph_segments += graph_segments
+                    total_eager_breaks += eager_breaks
+                addresses = entry.input_addresses
+                address_count = None
+                if addresses is not None:
+                    address_count = len(addresses)
+                    total_input_addresses += address_count
+                if index < max_entries:
+                    entry_summaries.append(
+                        {
+                            "descriptor": self._snapshot_bounded_repr(desc),
+                            "graph_segments": graph_segments,
+                            "eager_breaks": eager_breaks,
+                            "input_address_count": address_count,
+                            "input_addresses": (
+                                addresses[:max_addresses]
+                                if addresses is not None
+                                else None
+                            ),
+                        }
+                    )
 
-        return {
-            "entry_count": len(entries),
-            "entries_reported": len(entry_summaries),
-            "entries_truncated": len(entries) > max_entries,
-            "entries": entry_summaries,
-            "total_graph_segments": total_graph_segments,
-            "total_eager_breaks": total_eager_breaks,
-            "total_input_addresses": total_input_addresses,
-            "graph_pool_identity": id(wrapper.graph_pool),
-            "graph_pool_repr": self._snapshot_bounded_repr(wrapper.graph_pool),
-        }
+            return {
+                "entry_count": len(entries),
+                "entries_reported": len(entry_summaries),
+                "entries_truncated": len(entries) > max_entries,
+                "entries": entry_summaries,
+                "total_graph_segments": total_graph_segments,
+                "total_eager_breaks": total_eager_breaks,
+                "total_input_addresses": total_input_addresses,
+                "graph_pool_identity": id(wrapper.graph_pool),
+                "graph_pool_repr": self._snapshot_bounded_repr(wrapper.graph_pool),
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"error": self._snapshot_bounded_repr(exc)}
 
     def _snapshot_compilation(self) -> dict[str, Any] | None:
         """Effective compilation / breakable mode.
@@ -1106,7 +1116,7 @@ class Worker(WorkerBase):
                 mode is not None and getattr(mode, "value", 0) != 0
             ),
             "breakable_enabled": bool(is_breakable_cudagraph_enabled()),
-            "breakable_active": breakable is not None,
+            "breakable_active": breakable is not None and "error" not in breakable,
             "breakable": breakable,
         }
 
@@ -1116,32 +1126,37 @@ class Worker(WorkerBase):
         Reports only workspace slots that are already instantiated (non-None);
         reading tensor size/data_ptr never instantiates or mutates anything.
         Returns None when the workspace manager has not been initialized.
+        A per-block read failure is isolated and reported as ``{"error": ...}``
+        (matching ``_snapshot_cuda_memory``).
         """
-        if not is_workspace_manager_initialized():
-            return None
-        manager = current_workspace_manager()
-        slots = getattr(manager, "_current_workspaces", None)
-        instantiated: list[dict[str, Any]] = []
-        if isinstance(slots, (list, tuple)):
-            for ubatch_id, ws in enumerate(slots):
-                if ws is None:
-                    continue
-                instantiated.append(
-                    {
-                        "ubatch_id": ubatch_id,
-                        "bytes": int(ws.numel()) * int(ws.element_size()),
-                        "data_ptr": int(ws.data_ptr()),
-                    }
-                )
-        return {
-            "initialized": True,
-            "locked": bool(manager.is_locked()),
-            "num_ubatch_slots": (
-                len(slots) if isinstance(slots, (list, tuple)) else None
-            ),
-            "instantiated_count": len(instantiated),
-            "instantiated": instantiated,
-        }
+        try:
+            if not is_workspace_manager_initialized():
+                return None
+            manager = current_workspace_manager()
+            slots = getattr(manager, "_current_workspaces", None)
+            instantiated: list[dict[str, Any]] = []
+            if isinstance(slots, (list, tuple)):
+                for ubatch_id, ws in enumerate(slots):
+                    if ws is None:
+                        continue
+                    instantiated.append(
+                        {
+                            "ubatch_id": ubatch_id,
+                            "bytes": int(ws.numel()) * int(ws.element_size()),
+                            "data_ptr": int(ws.data_ptr()),
+                        }
+                    )
+            return {
+                "initialized": True,
+                "locked": bool(manager.is_locked()),
+                "num_ubatch_slots": (
+                    len(slots) if isinstance(slots, (list, tuple)) else None
+                ),
+                "instantiated_count": len(instantiated),
+                "instantiated": instantiated,
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"error": self._snapshot_bounded_repr(exc)}
 
     def get_rank_diagnostic_snapshot(self) -> dict[str, Any]:
         """Return a JSON-serializable, read-only per-rank diagnostic snapshot.

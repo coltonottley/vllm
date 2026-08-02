@@ -222,11 +222,15 @@ def test_no_mutating_cuda_or_model_calls_cuda_path():
     reset_peaks = Mock()
     synchronize = Mock()
     memory_snapshot = Mock()
+    cuda_graph = Mock()
+    graph_cm = Mock()
     with (
         patch("torch.cuda.empty_cache", empty_cache),
         patch("torch.cuda.reset_peak_memory_stats", reset_peaks),
         patch("torch.cuda.synchronize", synchronize),
         patch("torch.cuda.memory_snapshot", memory_snapshot),
+        patch("torch.cuda.CUDAGraph", cuda_graph),
+        patch("torch.cuda.graph", graph_cm),
         patch("torch.cuda.memory_allocated", return_value=1),
         patch("torch.cuda.memory_reserved", return_value=2),
         patch("torch.cuda.max_memory_allocated", return_value=3),
@@ -241,6 +245,8 @@ def test_no_mutating_cuda_or_model_calls_cuda_path():
     reset_peaks.assert_not_called()
     synchronize.assert_not_called()
     memory_snapshot.assert_not_called()
+    cuda_graph.assert_not_called()
+    graph_cm.assert_not_called()
     determine.assert_not_called()
 
 
@@ -286,11 +292,18 @@ def test_no_mutating_cuda_or_model_calls_breakable_path(
     synchronize = Mock()
     memory_snapshot = Mock()
     clear_all_graphs = Mock()
+    cuda_graph = Mock()
+    graph_cm = Mock()
+    begin_segment = Mock()
+    end_segment = Mock()
+    add_eager = Mock()
     with (
         patch("torch.cuda.empty_cache", empty_cache),
         patch("torch.cuda.reset_peak_memory_stats", reset_peaks),
         patch("torch.cuda.synchronize", synchronize),
         patch("torch.cuda.memory_snapshot", memory_snapshot),
+        patch("torch.cuda.CUDAGraph", cuda_graph),
+        patch("torch.cuda.graph", graph_cm),
         patch("torch.cuda.memory_allocated", return_value=1),
         patch("torch.cuda.memory_reserved", return_value=2),
         patch("torch.cuda.max_memory_allocated", return_value=3),
@@ -299,6 +312,9 @@ def test_no_mutating_cuda_or_model_calls_breakable_path(
         patch("torch.cuda.memory_stats", return_value={}),
         patch.object(BreakableCUDAGraphWrapper, "clear_all_graphs", clear_all_graphs),
         patch.object(BreakableCUDAGraphWrapper, "clear_graphs") as clear_graphs,
+        patch.object(BreakableCUDAGraphCapture, "_begin_segment", begin_segment),
+        patch.object(BreakableCUDAGraphCapture, "_end_segment", end_segment),
+        patch.object(BreakableCUDAGraphCapture, "add_eager", add_eager),
         patch.object(GpuWorker, "determine_available_memory") as determine,
     ):
         snapshot = worker.get_rank_diagnostic_snapshot()
@@ -307,8 +323,13 @@ def test_no_mutating_cuda_or_model_calls_breakable_path(
     reset_peaks.assert_not_called()
     synchronize.assert_not_called()
     memory_snapshot.assert_not_called()
+    cuda_graph.assert_not_called()
+    graph_cm.assert_not_called()
     clear_all_graphs.assert_not_called()
     clear_graphs.assert_not_called()
+    begin_segment.assert_not_called()
+    end_segment.assert_not_called()
+    add_eager.assert_not_called()
     determine.assert_not_called()
 
     breakable = snapshot["compilation"]["breakable"]
@@ -531,6 +552,82 @@ def test_v1_style_model_wrapped_breakable_is_detected(
     assert compilation["breakable"]["entries"][0]["input_addresses"] == [0x1111]
 
 
+def test_breakable_structural_surprise_is_isolated_per_block(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A per-rank structural surprise (a _BreakableEntry variant without a
+    readable ``capture``) must degrade to a bounded per-block error instead of
+    failing the whole collective snapshot."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+    )
+
+    _enable_breakable(monkeypatch)
+    wrapper = BreakableCUDAGraphWrapper.__new__(BreakableCUDAGraphWrapper)
+
+    class _BrokenEntry:
+        """Entry whose ``capture`` access raises (a rank-local surprise)."""
+
+        @property
+        def capture(self) -> None:
+            raise RuntimeError("broken capture attribute")
+
+        @property
+        def input_addresses(self) -> None:
+            raise RuntimeError("broken input addresses")
+
+    wrapper.entries = {BatchDescriptor(num_tokens=8, num_reqs=1): _BrokenEntry()}
+    wrapper.graph_pool = None
+    runner = SimpleNamespace(
+        cudagraph_manager=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            use_breakable_cg=True,
+            breakable_cg_runner=wrapper,
+        ),
+        model=object(),
+    )
+    worker = _make_worker(device=torch.device("cpu"), model_runner=runner)
+
+    snapshot = worker.get_rank_diagnostic_snapshot()
+    compilation = snapshot["compilation"]
+    # The breakable block degrades to a bounded error; the rest of the
+    # snapshot (identity, cuda, workspace) still returns.
+    assert "error" in compilation["breakable"]
+    assert compilation["breakable_active"] is False
+    assert compilation["breakable_enabled"] is True
+    assert snapshot["rank"] == 0
+    json.loads(json.dumps(snapshot))
+
+
+def test_breakable_entries_unsupported_type_is_isolated_per_block(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A wrapper whose ``entries`` is not a dict at all (rank-local surprise)
+    must not fail the whole snapshot."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+    )
+
+    _enable_breakable(monkeypatch)
+    wrapper = BreakableCUDAGraphWrapper.__new__(BreakableCUDAGraphWrapper)
+    wrapper.entries = "not-a-dict"
+    wrapper.graph_pool = None
+    runner = SimpleNamespace(
+        cudagraph_manager=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            use_breakable_cg=True,
+            breakable_cg_runner=wrapper,
+        ),
+        model=object(),
+    )
+    worker = _make_worker(device=torch.device("cpu"), model_runner=runner)
+
+    snapshot = worker.get_rank_diagnostic_snapshot()
+    assert "error" in snapshot["compilation"]["breakable"]
+    assert snapshot["compilation"]["breakable_active"] is False
+    json.loads(json.dumps(snapshot))
+
+
 # ---------------------------------------------------------------------------
 # Lazy workspace: only already-instantiated slots reported
 # ---------------------------------------------------------------------------
@@ -587,6 +684,42 @@ def test_workspace_reports_locked_state():
     workspace = worker.get_rank_diagnostic_snapshot()["workspace"]
     assert workspace["locked"] is True
     assert workspace["instantiated_count"] == 0
+
+
+def test_workspace_structural_surprise_is_isolated_per_block(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A workspace manager whose ``_current_workspaces`` read raises (a
+    rank-local surprise) must degrade to a bounded per-block error instead of
+    failing the whole collective snapshot."""
+    from vllm.v1.worker import gpu_worker as gpu_worker_module
+
+    class _BrokenManager:
+        """Manager whose workspace-slot access raises."""
+
+        @property
+        def _current_workspaces(self) -> None:
+            raise RuntimeError("broken workspaces")
+
+        def is_locked(self) -> bool:
+            return False
+
+    worker = _make_worker(device=torch.device("cpu"))
+    with (
+        patch.object(
+            gpu_worker_module, "is_workspace_manager_initialized", return_value=True
+        ),
+        patch.object(
+            gpu_worker_module,
+            "current_workspace_manager",
+            return_value=_BrokenManager(),
+        ),
+    ):
+        snapshot = worker.get_rank_diagnostic_snapshot()
+
+    assert "error" in snapshot["workspace"]
+    assert snapshot["rank"] == 0
+    json.loads(json.dumps(snapshot))
 
 
 # ---------------------------------------------------------------------------
