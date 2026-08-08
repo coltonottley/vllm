@@ -119,11 +119,14 @@ def test_c128a_decode_row_addresses_survive_batch_width_changes():
     b.compress_ratio = 128
     b.c128a_max_compressed = width_cap
     b.kv_cache_spec = SimpleNamespace(block_size=256)
-    b.c128a_topk_buffer = torch.full(
-        (max_tokens, width_cap), -1, dtype=torch.int32, device=device
+    b.c128a_global_decode_buffer = torch.zeros(
+        (max_tokens, width_cap), dtype=torch.int32, device=device
     )
     b.c128a_decode_lens_buffer = torch.zeros(
         max_tokens, dtype=torch.int32, device=device
+    )
+    b.c128a_prefill_buffer = torch.zeros(
+        (max_tokens, width_cap), dtype=torch.int32, device=device
     )
 
     def build(max_seq_len):
