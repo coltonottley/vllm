@@ -47,6 +47,18 @@ def _all_workers_barrier() -> None:
     group.barrier()
 
 
+def _stage_tp_barrier() -> None:
+    """Block until every rank of this pipeline stage's TP group has reached
+    this point (gloo cpu group).
+
+    The stage's TP group is the exact opener set of a stage-replicated
+    region: one shared region per pipeline stage, so only that stage's TP
+    ranks synchronize here."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    get_tp_group().barrier()
+
+
 class CPUOffloadingSpec(OffloadingSpec):
     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     SHARED_REGION_PER_RANK = True
@@ -126,43 +138,82 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
+        # One shared region per pipeline stage's TP group (stage-local TP
+        # dedupe under PP×TP parallelism).
+        self.stage_replicated_layout = (
+            config.stage_replicated_layout and self._uses_shared_region()
+        )
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
-            num_copies = 1 if self.replicated_layout else world_size
-            kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
-            kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
-
-            # calculate cpu_page_size_per_worker
-            self.cpu_page_size_per_worker = kv_bytes_per_chunk // num_copies
-
-            # calculate num_chunks
-            aligned_kv_bytes_per_chunk = round_up(
-                kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
-            )
-            shared_row_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
-            if (
-                self.SHARED_REGION_PER_RANK
-                and self._uses_shared_region()
-                and not self.replicated_layout
-            ):
-                aligned_kv_bytes_per_chunk = world_size * round_up(
-                    self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+            if self.stage_replicated_layout:
+                # All roles (scheduler, every PP stage) read the same
+                # per-stage rows, so the chunk count is equal by
+                # construction: the scheduler/PP0/PP1 divergence class is
+                # designed out. Each chunk row is the sum over stages of the
+                # page-aligned per-stage slot, and the tier holds one copy
+                # per pipeline stage.
+                aligned_stage_slots = tuple(
+                    round_up(
+                        stage_bytes * self.blocks_per_chunk,
+                        self.BLOCK_SIZE_ALIGNMENT,
+                    )
+                    for stage_bytes in config.stage_kv_bytes_per_block
                 )
-            self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
-            if self.num_chunks < shared_row_chunks and config.parallel.rank == 0:
-                logger.info(
-                    "Per-rank CPU offload regions page-align each rank's slot: "
-                    "%d chunks fit in cpu_bytes_to_use, %d fewer than with one "
-                    "shared row per chunk.",
-                    self.num_chunks,
-                    shared_row_chunks - self.num_chunks,
+                aligned_kv_bytes_per_chunk = sum(aligned_stage_slots)
+                # The worker's own stage page (this rank's region row).
+                self.cpu_page_size_per_worker = (
+                    config.worker_kv_bytes_per_block * self.blocks_per_chunk
                 )
+                self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+                self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
+            else:
+                # Rule A: the scheduler role at PP > 1 sizes its aggregate
+                # divisor from the largest stage row, so the scheduler's
+                # assignable chunk ids fit every stage's region (equal to
+                # the minimum per-stage chunk count by construction).
+                # Worker roles keep their own stage's geometry.
+                worker_kv_bytes_per_block = config.worker_kv_bytes_per_block
+                if config.scheduler_max_stage_slot_bytes > 0:
+                    worker_kv_bytes_per_block = max(
+                        worker_kv_bytes_per_block,
+                        config.scheduler_max_stage_slot_bytes,
+                    )
+                num_copies = 1 if self.replicated_layout else world_size
+                kv_bytes_per_block = worker_kv_bytes_per_block * num_copies
+                kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
 
-            # Expose aligned_kv_bytes_per_chunk as
-            # kv_bytes_per_chunk. Note that this might contain
-            # some padding. i.e. each offloaded chunk is of the form,
-            # |--- W0-C0---|---- W1-C0---| ... |---- Wn-C0---| *** maybe-pad *** |
-            # or |--- C0 (single copy) ---| *** maybe-pad *** |
-            self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
+                # calculate cpu_page_size_per_worker
+                self.cpu_page_size_per_worker = kv_bytes_per_chunk // num_copies
+
+                # calculate num_chunks
+                aligned_kv_bytes_per_chunk = round_up(
+                    kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
+                )
+                shared_row_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+                if (
+                    self.SHARED_REGION_PER_RANK
+                    and self._uses_shared_region()
+                    and not self.replicated_layout
+                    and not self.stage_replicated_layout
+                ):
+                    aligned_kv_bytes_per_chunk = world_size * round_up(
+                        self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+                    )
+                self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+                if self.num_chunks < shared_row_chunks and config.parallel.rank == 0:
+                    logger.info(
+                        "Per-rank CPU offload regions page-align each rank's "
+                        "slot: %d chunks fit in cpu_bytes_to_use, %d fewer "
+                        "than with one shared row per chunk.",
+                        self.num_chunks,
+                        shared_row_chunks - self.num_chunks,
+                    )
+
+                # Expose aligned_kv_bytes_per_chunk as
+                # kv_bytes_per_chunk. Note that this might contain
+                # some padding. i.e. each offloaded chunk is of the form,
+                # |--- W0-C0---|---- W1-C0---| ... |---- Wn-C0---| *** maybe-pad *** |
+                # or |--- C0 (single copy) ---| *** maybe-pad *** |
+                self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
 
         self.cpu_info = CPUOffloadingInfo.from_config(
             config, self.num_chunks, self.kv_bytes_per_chunk
@@ -227,8 +278,25 @@ class CPUOffloadingSpec(OffloadingSpec):
             row_bytes = self.kv_bytes_per_chunk
             world_size = self.config.parallel.world_size
             worker_index = self.config.parallel.rank
-            if self.replicated_layout:
+            if self.stage_replicated_layout:
+                # One shared region per pipeline stage's TP group: every rank
+                # of the stage maps the same rows, the elected stage writer
+                # (tp_rank_in_group == 0) stores, and the two stages' region
+                # files never collide.
+                engine_id += f"_pp{self.config.parallel.pp_rank}"
+                row_bytes = round_up(
+                    self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+                )
+                prefault_shard = (
+                    self.config.parallel.tp_rank_in_group,
+                    self.config.parallel.tp_size,
+                )
+                barrier = _stage_tp_barrier
+                private = False
+            elif self.replicated_layout:
                 prefault_shard = (worker_index, world_size)
+                barrier = _all_workers_barrier
+                private = False
             else:
                 engine_id += f"_{worker_index}"
                 row_bytes = round_up(
@@ -244,6 +312,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                     )
                 finally:
                     _all_workers_barrier()
+                barrier = None
+                private = True
 
             mmap_region = SharedOffloadRegion(
                 engine_id=engine_id,
@@ -251,9 +321,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank=0,
                 kv_bytes_per_chunk=row_bytes,
                 cpu_page_size=self.cpu_page_size_per_worker,
-                barrier=_all_workers_barrier if self.replicated_layout else None,
+                barrier=barrier,
                 num_segments=REGION_SEGMENTS,
-                private=not self.replicated_layout,
+                private=private,
                 populate_shard=None if self.async_init else prefault_shard,
                 populate=not self.async_init,
             )

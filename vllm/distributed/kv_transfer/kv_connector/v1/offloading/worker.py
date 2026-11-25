@@ -52,10 +52,18 @@ class OffloadingConnectorWorker:
         self.kv_cache_config = kv_cache_config
         self.worker: OffloadingWorker | None = None
         # Non-writers still ack: pending_count waits for world_size per job.
+        # Under stage_replicated_layout one elected writer per pipeline stage
+        # stores (tp_rank_in_group == 0, i.e. the first global rank of each
+        # stage), and the stage's other TP ranks ack-only through
+        # prepare_store_kv.
         self._is_store_writer = (
-            not self.spec.replicated_layout
+            (not self.spec.replicated_layout and not self.spec.stage_replicated_layout)
             or self.spec.config.canonical_layout
-            or self.spec.config.parallel.rank == 0
+            or (self.spec.replicated_layout and self.spec.config.parallel.rank == 0)
+            or (
+                self.spec.stage_replicated_layout
+                and self.spec.config.parallel.tp_rank_in_group == 0
+            )
         )
 
         # job_id -> req_id for in-flight loads (None for sync loads).

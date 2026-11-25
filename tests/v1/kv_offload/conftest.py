@@ -36,6 +36,11 @@ def make_offloading_config(
     is_parallelism_agnostic: bool = False,
     replicated_layout: bool = False,
     canonical_layout: bool = False,
+    pp_rank: int = 0,
+    tp_rank_in_group: int = 0,
+    stage_replicated_layout: bool = False,
+    stage_kv_bytes_per_block: tuple[int, ...] = (),
+    scheduler_max_stage_slot_bytes: int = 0,
     extra_config: dict[str, Any] | None = None,
 ) -> OffloadingConfig:
     normalized_extra_config = dict(extra_config or {})
@@ -74,7 +79,12 @@ def make_offloading_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank_local=data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            pp_rank=pp_rank,
+            tp_rank_in_group=tp_rank_in_group,
         ),
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
+        stage_replicated_layout=stage_replicated_layout,
+        stage_kv_bytes_per_block=stage_kv_bytes_per_block,
+        scheduler_max_stage_slot_bytes=scheduler_max_stage_slot_bytes,
     )

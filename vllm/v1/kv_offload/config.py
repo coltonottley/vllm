@@ -112,6 +112,12 @@ class OffloadingParallelConfig:
     # under any topology; for the canonical layout, the canonical page itself
     # is topology-free.
     is_parallelism_agnostic: bool
+    # Pipeline stage of this rank (rank // tp_size under the PP×TP-only
+    # layout). 0 on the scheduler side.
+    pp_rank: int = 0
+    # Rank within this rank's pipeline stage's TP group
+    # (rank % tp_size under the PP×TP-only layout).
+    tp_rank_in_group: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,5 +144,20 @@ class OffloadingConfig:
     # True when the canonical per-layer host byte layout was requested via
     # kv_connector_extra_config; certified per-layer at worker registration.
     canonical_layout: bool = False
+    # True when one shared host region per pipeline stage's TP group was
+    # requested via kv_connector_extra_config (stage-local TP dedupe under
+    # PP×TP parallelism). Eligibility is certified fail-closed by
+    # build_offloading_config; each stage's TP ranks hold byte-identical KV,
+    # so one copy per stage replaces one copy per rank.
+    stage_replicated_layout: bool = False
+    # Per-stage worker KV bytes per block, ordered by PP rank (from
+    # KVCacheConfig.pipeline_stages). Populated when stage_replicated_layout
+    # is eligible.
+    stage_kv_bytes_per_block: tuple[int, ...] = ()
+    # Largest per-stage worker KV bytes per block across pipeline stages,
+    # populated on the scheduler role when pipeline_parallel_size > 1. The
+    # scheduler sizes its chunk-id space with this slot so no assigned chunk
+    # id exceeds any stage's region (rule A). 0 leaves sizing unchanged.
+    scheduler_max_stage_slot_bytes: int = 0
     # Resolved KVCacheLayout name of the worker KV cache.
     kv_cache_layout: str | None = None

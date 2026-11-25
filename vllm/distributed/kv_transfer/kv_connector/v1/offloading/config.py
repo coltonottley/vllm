@@ -4,6 +4,7 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_planning import kv_cache_groups_tp_replicas
 from vllm.v1.core.kv_cache_utils import (
@@ -75,6 +76,7 @@ def get_sliding_window_size_in_chunks(
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
+    role: KVConnectorRole | None = None,
 ) -> OffloadingConfig:
     """Translate vLLM configuration into the native offloading boundary."""
     kv_transfer_config = vllm_config.kv_transfer_config
@@ -257,6 +259,146 @@ def build_offloading_config(
             )
         )
 
+    # Stage-local TP dedupe: one shared host region per pipeline stage's TP
+    # group. Each stage's TP ranks hold byte-identical KV, so one copy per
+    # stage replaces one copy per rank. Opt-in via kv_connector_extra_config;
+    # every eligibility gate below must hold, and a requested-but-ineligible
+    # configuration fails closed (a silent fallback would silently multiply
+    # the tier by the number of ranks per stage).
+    stage_replicated_layout = bool(extra_config.get("stage_replicated_layout", False))
+    stage_kv_bytes_per_block: tuple[int, ...] = ()
+    if stage_replicated_layout:
+        if canonical_layout:
+            raise ValueError(
+                "stage_replicated_layout cannot be combined with "
+                "canonical_layout: the canonical layout certifies a "
+                "topology-free page that would collapse distinct pipeline "
+                "stages into one namespace."
+            )
+        stage_gates = (
+            (
+                "model must use MLA (use_mla)",
+                vllm_config.model_config.use_mla,
+            ),
+            (
+                "tensor_parallel_size must be > 1",
+                parallel_config.tensor_parallel_size > 1,
+            ),
+            (
+                "pipeline_parallel_size must be > 1",
+                parallel_config.pipeline_parallel_size > 1,
+            ),
+            (
+                (
+                    "per-stage KV must be TP-replicated "
+                    "(kv_tp_replicas == tensor_parallel_size)"
+                ),
+                kv_tp_replicas == parallel_config.tensor_parallel_size,
+            ),
+            (
+                "worker_kv_bytes_per_block must be > 0",
+                worker_kv_bytes_per_block > 0,
+            ),
+            (
+                "prefill_context_parallel_size must be 1",
+                parallel_config.prefill_context_parallel_size == 1,
+            ),
+            (
+                "decode_context_parallel_size must be 1",
+                parallel_config.decode_context_parallel_size == 1,
+            ),
+            (
+                (
+                    "world_size must equal pipeline_parallel_size * "
+                    "tensor_parallel_size (no data parallelism)"
+                ),
+                parallel_config.world_size
+                == parallel_config.pipeline_parallel_size
+                * parallel_config.tensor_parallel_size,
+            ),
+            (
+                "data_parallel_size must be 1 (PP×TP only)",
+                parallel_config.data_parallel_size == 1,
+            ),
+            (
+                (
+                    "distributed_executor_backend must be 'mp' (single-node "
+                    "shared memory)"
+                ),
+                parallel_config.distributed_executor_backend == "mp",
+            ),
+            (
+                "nnodes_within_dp must be 1",
+                parallel_config.nnodes_within_dp == 1,
+            ),
+            (
+                "hisparse_host_num_blocks must be None",
+                kv_cache_config.hisparse_host_num_blocks is None,
+            ),
+            (
+                (
+                    "pipeline_stages must cover every pipeline stage "
+                    "(len(pipeline_stages) == pipeline_parallel_size)"
+                ),
+                len(kv_cache_config.pipeline_stages)
+                == parallel_config.pipeline_parallel_size,
+            ),
+            (
+                "every pipeline stage must have bytes_per_block > 0",
+                all(
+                    stage.bytes_per_block > 0
+                    for stage in kv_cache_config.pipeline_stages
+                ),
+            ),
+        )
+        failed_gates = [name for name, holds in stage_gates if not holds]
+        if failed_gates:
+            raise ValueError(
+                "stage_replicated_layout was requested but is ineligible: "
+                + "; ".join(failed_gates)
+            )
+        stage_kv_bytes_per_block = tuple(
+            stage.bytes_per_block for stage in kv_cache_config.pipeline_stages
+        )
+
+    # Rule A: the scheduler's chunk-id space must fit every stage's region,
+    # so the scheduler role sizes its aggregate divisor from the largest
+    # stage row (equal to the minimum per-stage chunk count by construction).
+    # No-op at pipeline_parallel_size == 1 and on every worker role.
+    scheduler_max_stage_slot_bytes = 0
+    if (
+        role is KVConnectorRole.SCHEDULER
+        and parallel_config.pipeline_parallel_size > 1
+        and kv_cache_config.pipeline_stages
+    ):
+        scheduler_max_stage_slot_bytes = max(
+            stage.bytes_per_block for stage in kv_cache_config.pipeline_stages
+        )
+
+    # Pipeline stage identities, valid under the PP×TP-only rank layout
+    # (rank = pp_rank * tp_size + tp_rank_in_group).
+    pp_rank = 0
+    tp_rank_in_group = 0
+    if (
+        parallel_config.world_size
+        == parallel_config.pipeline_parallel_size * parallel_config.tensor_parallel_size
+    ):
+        pp_rank = parallel_config.rank // parallel_config.tensor_parallel_size
+        tp_rank_in_group = parallel_config.rank % parallel_config.tensor_parallel_size
+
+    if stage_replicated_layout:
+        # The tensor-derived worker page must agree with the engine core's
+        # own stage row: the scheduler's config is PP0-shaped (stage 0) and
+        # each worker's config is its own stage's.
+        expected_slot_index = 0 if role is KVConnectorRole.SCHEDULER else pp_rank
+        if worker_kv_bytes_per_block != stage_kv_bytes_per_block[expected_slot_index]:
+            raise ValueError(
+                "stage_replicated_layout found inconsistent stage geometry: "
+                f"worker_kv_bytes_per_block={worker_kv_bytes_per_block} but "
+                f"pipeline_stages[{expected_slot_index}]="
+                f"{stage_kv_bytes_per_block[expected_slot_index]}."
+            )
+
     kv_events_config = vllm_config.kv_events_config
     cache_dtype = (
         vllm_config.model_config.dtype
@@ -293,8 +435,13 @@ def build_offloading_config(
             data_parallel_size=parallel_config.data_parallel_size,
             data_parallel_rank_local=parallel_config.data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            pp_rank=pp_rank,
+            tp_rank_in_group=tp_rank_in_group,
         ),
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
+        stage_replicated_layout=stage_replicated_layout,
+        stage_kv_bytes_per_block=stage_kv_bytes_per_block,
+        scheduler_max_stage_slot_bytes=scheduler_max_stage_slot_bytes,
         kv_cache_layout=vllm_config.cache_config.kv_cache_layout,
     )

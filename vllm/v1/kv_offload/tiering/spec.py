@@ -333,6 +333,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         return metrics
 
     def __init__(self, config: OffloadingConfig):
+        if config.stage_replicated_layout:
+            # Fail closed: tiering's create_worker allocates one region per
+            # worker index, which would silently multiply a stage-replicated
+            # tier by the ranks of the stage instead of refusing.
+            raise ValueError(
+                "stage_replicated_layout is not supported with "
+                "TieringOffloadingSpec (secondary tiers); use a single CPU "
+                "tier."
+            )
         super().__init__(config)
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None

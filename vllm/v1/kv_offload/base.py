@@ -810,6 +810,9 @@ class OffloadingSpec(ABC):
         self.config = config
         self.extra_config = config.extra_config
         self.replicated_layout: bool = False
+        # One shared host region per pipeline stage's TP group; overriden by
+        # specs that support it (see CPUOffloadingSpec).
+        self.stage_replicated_layout: bool = False
         # When True, the worker finishes its setup in the background and the
         # engine serves without offloading until every worker is ready.
         self.async_init: bool = False

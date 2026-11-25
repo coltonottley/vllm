@@ -87,7 +87,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
-        offloading_config = build_offloading_config(vllm_config, kv_cache_config)
+        # The role reaches the config builder so the scheduler side can size
+        # its chunk-id space from every pipeline stage (rule A) while workers
+        # keep their own stage's geometry.
+        offloading_config = build_offloading_config(
+            vllm_config, kv_cache_config, role=role
+        )
         self._canonical_layout = offloading_config.canonical_layout
         spec = OffloadingSpecFactory.create_spec(offloading_config)
 
